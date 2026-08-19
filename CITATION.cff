@@ -1,9 +1,9 @@
 cff-version: 1.2.0
 message: "If you use this repository, please cite the associated article."
-title: "LSSF: raw data and analysis code"
+title: "Liquid-state surface fermentation as a platform for pure mycelium materials production"
 authors:
   - given-names: Jara
-    family-names: "REPLACE-WITH-SURNAME"
+    family-names: "Saluena"
 # Add co-authors here.
 date-released: 2026-01-01
 version: "1.0.0"
