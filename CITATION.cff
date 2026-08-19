@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this repository, please cite the associated article."
+title: "LSSF: raw data and analysis code"
+authors:
+  - given-names: Jara
+    family-names: "REPLACE-WITH-SURNAME"
+# Add co-authors here.
+date-released: 2026-01-01
+version: "1.0.0"
+license: MIT

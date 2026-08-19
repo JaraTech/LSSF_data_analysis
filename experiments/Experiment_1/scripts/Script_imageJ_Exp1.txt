@@ -1,0 +1,133 @@
+// Script_imageJ_Exp1.txt
+//
+// ImageJ / Fiji macro for the Experiment 1 (RSM colony-surface grey-value) image set.
+// One photographed colony per image (7x7 time x volume design = 49 images).
+//
+// What it does: walks an input folder of photographs, and for each image it
+//   1. standardises brightness/contrast so images shot under slightly
+//      different lighting can be compared,
+//   2. thresholds the image and detects the large object(s) in it as ROIs,
+//   3. measures shape and intensity statistics for each object,
+//   4. saves an annotated JPG (yellow outline around each object) plus a
+//      per-image CSV of the measurements.
+//
+// How to run: open ImageJ/Fiji, then either drag this file onto the toolbar
+//   or use Plugins > Macros > Run..., and pick this file. When it starts it
+//   asks you to choose an input folder and an output folder (see the README).
+//   No paths are hardcoded, so it runs the same on any machine.
+//
+// Requires: ImageJ 1.52+ or Fiji. No extra plugins.
+//
+// Parameters you may need to tune for a different image set are grouped at
+// the top and flagged with "TUNE:" below.
+
+// TUNE: only files ending in this suffix are processed. Change if your
+// pictures are .jpg / .tif / .png instead of .jpeg.
+suffix = ".jpeg";
+
+// Directories are not written into the macro: getDirectory() makes ImageJ pop up
+// a native folder-picker dialog on each run (the text is only the dialog title),
+// so nothing is machine-specific. When prompted, choose data/raw/images as the
+// input and data/processed as the output (see the README).
+input  = getDirectory("Select the INPUT folder (raw images to process)");
+output = getDirectory("Select the OUTPUT folder (annotated images + result CSVs)");
+
+processFolder(input);
+
+// Recurse through the input folder (and any subfolders) and hand every file
+// with the target suffix to processFile(). Files are sorted so runs are
+// reproducible and the output order is predictable.
+function processFolder(input) {
+	list = getFileList(input);
+	list = Array.sort(list);
+	for (i = 0; i < list.length; i++) {
+		if(File.isDirectory(input + File.separator + list[i]))
+			processFolder(input + File.separator + list[i]);
+		if(endsWith(list[i], suffix))
+			processFile(input, output, list[i]);
+	}
+}
+
+// Process one image: standardise it, detect objects, measure them, and save
+// an annotated picture plus a CSV of the measurements to the output folder.
+function processFile(input, output, file) {
+	// Progress line so you can see which image is being handled and spot the
+	// one that failed if a run stops partway through.
+	print("Processing: " + input + File.separator + file);
+	open(input + File.separator + file);
+	imageName=getTitle;
+
+		// Start from a clean ROI Manager so ROIs from the previous image
+		// can't leak into this one's measurements.
+		if (isOpen("ROI Manager")) {
+    		selectWindow("ROI Manager");
+     		run("Close");
+ 		}
+
+		// --- Standardisation copy ---------------------------------------
+		// "Balanced.png" is the copy we take intensity measurements from.
+		// Converting to 8-bit greyscale + colour balance + contrast stretch
+		// puts every image on a comparable brightness scale before measuring.
+		run("Duplicate...", "title=Balanced.png");
+		run("8-bit");
+		run("Color Balance...");
+		run("Enhance Contrast", "saturated=0.35");
+		run("Close");
+
+		// --- Object detection copy --------------------------------------
+		// "Particled.png" is a separate copy used only to find object
+		// outlines, so the thresholding doesn't alter the pixels we measure.
+		run("Duplicate...", "title=Particled.png");
+		// TUNE: threshold range that separates object from background.
+		setThreshold(30, 180, "raw");
+		run("Convert to Mask");
+		// TUNE: size filter (in pixels^2). Only objects at least this large
+		// are kept, which drops speckle/noise. "add" stores each survivor as
+		// an ROI in the ROI Manager.
+		run("Analyze Particles...", "size=2000000-Infinity circularity=0.00-Infinity add");
+
+		// Number of objects found in this image.
+		n = roiManager("count");
+		print(n);
+// Optional: shrink each ROI inward by 10px to avoid measuring the object's
+// edge. Disabled by default; enable if edge pixels bias the intensity stats.
+//for (i=0; i<n; i++) {
+//          roiManager("select", i);
+//          run("Enlarge...", "enlarge=-10");
+//          roiManager("update");
+//      	}
+
+		// --- Measure ----------------------------------------------------
+		// Measure the detected ROIs on the *standardised* Balanced.png, not on
+		// the thresholded mask, so intensity stats reflect real pixel values.
+		run("Set Measurements...", "area mean standard modal centroid median skewness kurtosis redirect=None decimal=3");
+		run("Clear Results");
+		roiManager("Select", Array.getSequence(n));
+		selectImage("Balanced.png");
+		roiManager("Measure");
+
+		// --- Annotate ---------------------------------------------------
+		// Draw the ROIs back onto the original image as a thick yellow outline,
+		// flatten so the outline is baked into the pixels, then scale down to a
+		// smaller preview (0.4x) that's quick to open and share.
+		selectWindow(imageName);
+			roiManager("Select",Array.getSequence(n));
+			roiManager("Set Color", "yellow");
+			roiManager("Set Line Width", 10);
+			roiManager("Update");
+			run("Flatten");
+			run("Scale...", "x=0.4 y=0.4 width=510 height=702 interpolation=Bilinear average create");
+
+		// Save the annotated preview next to a CSV named after the source
+		// image, so each result file is traceable to the picture it came from.
+		saveAs("jpg", output + File.separator + file);
+
+		selectWindow("Results");
+			saveAs("Results", output + File.separator + "Results" + file + ".csv");
+
+			run("Clear Results");
+		close();
+		// Close every window before the next image so memory doesn't build up
+		// across a large batch.
+		run("Close All");
+}

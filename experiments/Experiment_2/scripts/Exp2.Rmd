@@ -1,0 +1,2168 @@
+---
+title: "LSSF_Exp2"
+output: html_document
+date: "2026-02-19"
+---
+
+## Setting up the document
+
+Packages & directories
+```{r, include = F}
+# 1. Dependencies
+# Clear the workspace so a rerun starts from a known-empty state.
+rm(list = ls())
+# Packages and the shared ggplot theme are defined once in shared/dependencies.R
+# (see the root README), so a clean clone reproduces without editing this
+# notebook. here::here() resolves paths from the .here file at the repo root;
+# bootstrap the here package itself first in case it is missing.
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+source(here::here("shared", "dependencies.R"))
+
+# 2. Paths - portable, anchored by the .here file at the repo root (nothing
+# machine-specific). Trailing "/" is kept so the paste0(path.*, "file") calls
+# used throughout the notebook still resolve.
+base         <- here::here("experiments", "Experiment_2")
+path.raw     <- paste0(base, "/data/raw/")                   # measured inputs: 1 - Exp2_Biomass.csv, 2 - Mech/, images/
+path.mech    <- paste0(base, "/data/raw/2 - Mech/")          # mechanical test exports (Exp2_*.csv)
+path.gv      <- paste0(base, "/data/processed/grey_values/") # ImageJ surface CSVs (Exp2_A1..L3)
+path.figures <- paste0(base, "/results/figures/")            # final paper figures (ggsave)
+path.tables  <- paste0(base, "/results/tables/")             # final paper tables
+```
+
+
+Palettes
+```{r}
+my_palette <- c("#EF9C9C", "#CC3C3C", "#7B0101", "#9DCFDA", "#257E92", "#004758")
+my_palette2 <- c("#CC3C3C", "#257E92")
+my_palette3 <- c("#C08FE2", "#813EAF", "#4F0A80")
+conditions <- c("Agar 1", "Agar 2", "Agar 3", "Liquid 1", "Liquid 2", "Liquid 3")
+conditions2 <- c("Agar", "Liquid")
+conditions3 <- c("B", "BS", "BSB")
+```
+
+Function to add new factors in dataframes
+```{r}
+conditions_bp <- function(data) {
+  
+  data %>%
+    mutate(
+      Levels = case_when(
+        Condition == "P1" ~ 1,
+        Condition == "P3" ~ 2,
+        Condition == "P2" ~ 3,
+        Condition == "T1" ~ 4,
+        Condition == "T3" ~ 5,
+        Condition == "T2" ~ 6
+      ),
+      Levels = factor(Levels, levels = 1:6),
+      
+      New_condition = factor(case_when(
+        Condition == "P1" ~ "A1",
+        Condition == "P3" ~ "A2",
+        Condition == "P2" ~ "A3",
+        Condition == "T1" ~ "L1",
+        Condition == "T3" ~ "L2",
+        Condition == "T2" ~ "L3"
+      )),
+      
+      InN = factor(if_else(Levels %in% 1:3, 1, 2)),
+      
+      PrN = factor(case_when(
+        Levels %in% c(1, 4) ~ 1,
+        Levels %in% c(2, 5) ~ 2,
+        Levels %in% c(3, 6) ~ 3
+      )),
+      
+      In = factor(if_else(Levels %in% 1:3,
+                          conditions2[1],
+                          conditions2[2])),
+      
+      Pr = factor(case_when(
+        Levels %in% c(1, 4) ~ conditions3[1],
+        Levels %in% c(2, 5) ~ conditions3[2],
+        Levels %in% c(3, 6) ~ conditions3[3]
+      ))
+    )
+}
+
+
+```
+
+
+Helpers: significance letters ordered by magnitude
+```{r}
+# The compact-letter displays in this notebook follow the paper's convention:
+# "a" is the group with the HIGHEST mean (or median), "b" the next, and so on.
+# multcompLetters() labels groups in source order, so these helpers relabel them
+# by magnitude.
+
+# Parametric (aov + Tukey): letters ordered by descending group mean (a = highest).
+# Pass the fitted aov and the factor name; returns a named vector (names = group
+# levels) to index by group, e.g. cld_desc(aov(y ~ g, data), "g")[as.character(g)].
+cld_desc <- function(model, term) multcompView::multcompLetters4(model, TukeyHSD(model))[[term]]$Letters
+
+# Non-parametric, 2 groups (e.g. by inoculum): order the two letters by descending
+# median. p = adjusted wilcoxon p-value; returns a named vector by group.
+cld_median2 <- function(p, values, groups) {
+  med <- tapply(values, groups, median)
+  ord <- names(sort(med, decreasing = TRUE))
+  if (!is.na(p) && p < 0.05) setNames(c("a", "b"), ord) else setNames(c("a", "a"), ord)
+}
+
+# Non-parametric, 3+ groups (e.g. by level or by process): pairwise Wilcoxon (BH)
+# compact-letter display. multcompLetters() gives the correct grouping but labels
+# in an arbitrary order, so the letters are relabelled by descending group median
+# ("a" = highest-median group), matching the paper's convention and the parametric
+# cld_desc() above. Returns a named vector (names = group levels) to index by group.
+cld_wilcox_desc <- function(values, groups, p.adjust.method = "BH") {
+  groups <- as.character(groups)
+  pv  <- suppressWarnings(pairwise.wilcox.test(values, groups, p.adjust.method = p.adjust.method)$p.value)
+  pv_vec <- as.vector(pv)
+  names(pv_vec) <- paste(rep(rownames(pv), ncol(pv)),
+                         rep(colnames(pv), each = nrow(pv)), sep = "-")
+  pv_vec <- pv_vec[!is.na(pv_vec)]
+  L <- multcompView::multcompLetters(pv_vec)$Letters      # correct grouping, arbitrary labels
+  score <- tapply(values, groups, median)                 # relabel so a = highest median
+  distinct <- unique(unlist(strsplit(paste(L, collapse = ""), "")))
+  lscore <- sapply(distinct, function(ch) max(score[names(L)[grepl(ch, L, fixed = TRUE)]]))
+  neworder <- names(sort(lscore, decreasing = TRUE))
+  remap <- setNames(letters[seq_along(neworder)], neworder)
+  vapply(L, function(s) paste(sort(remap[strsplit(s, "")[[1]]]), collapse = ""), character(1))
+}
+```
+
+### DATAFRAMES
+Biomass dataframe: my_data
+```{r}
+my_data <- read.csv(paste0(path.raw, "1 - Exp2_Biomass.csv"))
+res.df <- my_data %>%
+  dplyr::select(Condition, Levels, Replicate, pH, FBM, DBM) %>%
+  dplyr::rename(GBM = DBM) %>%                 # DBM column from the CSV = glycerol biomass
+  mutate(cDBM = FBM * 0.0547) %>%              # calculated dry biomass (regression on fresh biomass)
+  conditions_bp() %>%
+  mutate(Ident = paste0(New_condition, "_", Replicate))
+head(res.df)
+```
+## Biomass
+
+### Fresh biomass by level
+Stats fresh biomass by level
+```{r}
+## Tables mean by Level
+mean.FBM <- res.df %>% 
+  group_by(Levels, New_condition, In, Pr, InN, PrN) %>%
+  summarise_at("FBM", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.FBM
+```
+
+
+Fresh biomass significance by level
+```{r}
+results <- lm(FBM~Levels, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(FBM~Levels, data=res.df)
+
+# Letters ordered by descending mean (a = highest), computed from Tukey via cld_desc().
+cld <- cld_desc(aov(FBM ~ Levels, data = res.df), "Levels")
+mean.signif.FBM <- mean.FBM %>% mutate(Letter = cld[as.character(Levels)])
+mean.signif.FBM
+#write.table(mean.signif.FBM, file = paste0(path.tables, "2 - Exp2_FBM_byLevel_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+
+Fresh biomass plot by level
+```{r}
+graph_FBM <- ggplot(res.df, aes(x = Levels, y = FBM, group = Levels, fill = Levels)) +
+  labs(y = "Biomass (g)", x = NULL) +
+  geom_boxplot(lwd = 0.2) +
+  #ylim(c(0, 11)) +
+  scale_fill_manual(name = "", values = my_palette, labels = conditions) +
+  geom_text(data = mean.signif.FBM,
+            aes(x = Levels, label = Letter,
+                y = mean + c(0.8, 0.8, 0.8, 1.8, 0.8, 0.8) * 0.0547, group = Levels), colour = "black") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  guides(group = "none", colour = "none", fill = guide_legend(nrow = 1)) +   # <-- single-row legend
+  theme(legend.position = "none")
+graph_FBM
+ggsave(paste0(path.figures, "1. Exp2_FBM.svg"), graph_FBM, width=6, height=6, units="cm", scale=1.3)
+```
+
+
+
+
+### Fresh biomass by inoc
+Stats fresh biomass by inoc
+```{r}
+## Tables mean by Inoc
+mean.FBM2 <- res.df %>% 
+  group_by(In, InN) %>%
+  summarise_at("FBM", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.FBM2
+```
+
+Fresh biomass significance by inoc
+```{r}
+results <- lm(FBM~In, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(FBM~In, data=res.df)
+
+cld <- cld_desc(aov(FBM ~ In, data = res.df), "In")
+mean.signif.FBM2 <- mean.FBM2 %>% mutate(Letter = cld[as.character(In)])
+mean.signif.FBM2
+#write.table(mean.signif.FBM2, file = paste0(path.tables, "2 - Exp2_FBM_byInoc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+
+
+### Fresh biomass by proc
+Stats fresh biomass by proc
+```{r}
+## Tables mean by Proc
+mean.FBM3 <- res.df %>% 
+  group_by(Pr) %>%
+  summarise_at("FBM", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.FBM3
+```
+
+Fresh biomass significance by proc
+```{r}
+results <- lm(FBM~Pr, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(FBM~Pr, data=res.df)
+
+# Additive model: process (B / BS / BSB) on its own shows NO significant
+# differences (all "a"). Letters ordered by descending mean via cld_desc().
+cld <- cld_desc(aov(FBM ~ Pr, data = res.df), "Pr")
+mean.signif.FBM3 <- mean.FBM3 %>% mutate(Letter = cld[as.character(Pr)])
+mean.signif.FBM3
+#write.table(mean.signif.FBM3, file = paste0(path.tables, "2 - Exp2_FBM_byProc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+```{r}
+# Interaction model: once inoculation (In) is in the model, the process effect
+# DOES become significant (B differs from BS/BSB). Kept alongside the additive
+# result above to document that contrast, and written to its own object so the
+# two do not overwrite each other. Letters from the interaction model's Pr term.
+results <- lm(FBM ~ Pr * In, data = res.df)
+plot(results, which = 2)
+shapiro.test(residuals(results))
+leveneTest(FBM ~ Pr * In, data = res.df)
+
+cld <- cld_desc(aov(FBM ~ Pr * In, data = res.df), "Pr")
+mean.signif.FBM3.int <- mean.FBM3 %>% mutate(Letter = cld[as.character(Pr)])
+mean.signif.FBM3.int
+
+```
+
+
+
+## Calculated dry biomass (cDBM)
+Dry biomass significance by level
+```{r}
+
+mean.cDBM <- res.df %>% 
+  group_by(Levels, New_condition, In, Pr, InN, PrN) %>%
+  summarise_at("cDBM", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+
+cld <- cld_desc(aov(cDBM ~ Levels, data = res.df), "Levels")
+mean.signif.cDBM <- mean.cDBM %>% mutate(Letter = cld[as.character(Levels)])
+mean.signif.cDBM
+```
+
+Plot cDBM by level
+```{r}
+conditions <- c("Agar B", "Agar BS", "Agar BSB", "Liquid B", "Liquid BS", "Liquid BSB")
+graph_cDBM <- ggplot(res.df, aes(x = Levels, y = cDBM, group = Levels, fill = Levels)) +
+  labs(y = "Biomass (g)", x = NULL) +
+  geom_boxplot(lwd = 0.2) +
+  #ylim(c(0, 11)) +
+  scale_fill_manual(name = "", values = my_palette, labels = conditions) +
+  geom_text(data = mean.signif.cDBM,
+            aes(x = Levels, label = Letter,
+                y = mean + c(0.8, 0.8, 0.8, 1.8, 0.8, 0.8) * 0.0547, group = Levels), colour = "black") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  guides(group = "none", colour = "none", fill = guide_legend(nrow = 1)) +   # <-- single-row legend
+  theme(legend.position = "none")
+graph_cDBM
+#ggsave(paste0(path.figures, "Exp2_cDBM.svg"), graph_cDBM, width=7, height=6, units="cm", scale=1.3)
+```
+
+
+### Calculated dry biomass by inoc
+Stats fresh biomass by inoc
+```{r}
+## Tables mean by Inoc
+mean.cDBM2 <- res.df %>% 
+  group_by(In, InN) %>%
+  summarise_at("cDBM", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.cDBM2
+```
+
+Dry biomass significance by inoc
+```{r}
+results <- lm(cDBM~In, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(cDBM~In, data=res.df)
+
+cld <- cld_desc(aov(cDBM ~ In, data = res.df), "In")
+mean.signif.cDBM2 <- mean.cDBM2 %>% mutate(Letter = cld[as.character(In)])
+mean.signif.cDBM2
+#write.table(mean.signif.cDBM2, file = paste0(path.tables, "2 - Exp2_cDBM_byInoc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+
+
+### Calculated dry biomass by proc
+Stats dry biomass by proc
+```{r}
+## Tables mean by Proc
+mean.cDBM3 <- res.df %>% 
+  group_by(Pr) %>%
+  summarise_at("cDBM", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.cDBM3
+```
+
+Dry biomass significance by proc
+```{r}
+results <- lm(cDBM~Pr, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(cDBM~Pr, data=res.df)
+
+# Additive model (cDBM ~ Pr): process alone shows NO significant differences (all "a").
+cld <- cld_desc(aov(cDBM ~ Pr, data = res.df), "Pr")
+mean.signif.cDBM3 <- mean.cDBM3 %>% mutate(Letter = cld[as.character(Pr)])
+mean.signif.cDBM3
+#write.table(mean.signif.cDBM3, file = paste0(path.tables, "2 - Exp2_cDBM_byProc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+```{r}
+# Interaction model (cDBM ~ Pr*In): with inoculation in the model the process
+# effect becomes significant. Kept as its own object (additive was non-significant).
+cld <- cld_desc(aov(cDBM ~ Pr * In, data = res.df), "Pr")
+mean.signif.cDBM3.int <- mean.cDBM3 %>% mutate(Letter = cld[as.character(Pr)])
+mean.signif.cDBM3.int
+```
+
+
+### Glycerol biomass
+#### Glycerol biomass by level
+Stats glycerol biomass
+```{r}
+mean.GBM <- res.df %>% 
+  group_by(Levels, New_condition, In, Pr, InN, PrN) %>%
+  summarise_at("GBM", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.GBM
+```
+
+Glycerol biomass significance
+```{r}
+results <- lm(GBM~In*Pr, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(GBM~In*Pr, data=res.df)
+
+cld <- cld_desc(aov(GBM ~ Levels, data = res.df), "Levels")
+mean.signif.GBM <- mean.GBM %>% mutate(Letter = cld[as.character(Levels)])
+mean.signif.GBM
+#write.table(mean.signif.GBM, file = paste0(path.tables, "2 - Exp2_GBM_stats.csv"), dec = '.', sep =",", row.names = F)
+
+```
+
+PLOT GBM by level
+```{r}
+graph_GBM <- ggplot(res.df, aes(x = Levels, y = GBM, group = Levels, fill = Levels)) +
+  labs(y = "Biomass (g)", x = NULL) +
+  geom_boxplot(lwd = 0.2) +
+  scale_fill_manual(name = "", values = my_palette, labels = conditions) +
+  geom_text(data = mean.signif.GBM,
+            aes(x = Levels, label = Letter,
+                y = mean + c(0.14, 0.18, 0.22, 0.26, 0.32, 0.14), group = Levels), colour = "black") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  guides(group = "none", colour = "none", fill = guide_legend(nrow = 1)) +   # <-- single-row legend
+  theme(legend.position = "bottom")
+graph_GBM
+#ggsave(paste0(path.figures, "Exp2_GBM.svg"), graph_GBM, width=10, height=6, units="cm", scale=1.3)
+```
+
+
+
+
+<!-- fam.df (the per-replicate material database) is built in the
+     "DATA frame per specimen" section, from the in-session tables. -->
+
+
+
+
+
+#### Glycerol biomass by inoc
+Stats glycerol biomass by inoc
+```{r}
+## Tables mean by Inoc
+mean.GBM2 <- res.df %>% 
+  group_by(In, InN) %>%
+  summarise_at("GBM", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.GBM2
+```
+
+Glycerol biomass significance by inoc
+```{r}
+results <- lm(GBM~In, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(GBM~In, data=res.df)
+
+# non-parametric (wilcoxon), 2 groups: order the two letters by descending median
+pv <- pairwise.wilcox.test(res.df$GBM, res.df$In, p.adjust.method = "BH")$p.value["Liquid", "Agar"]
+mean.signif.GBM2 <- mean.GBM2 %>% mutate(Letter = cld_median2(pv, res.df$GBM, res.df$In)[as.character(In)])
+mean.signif.GBM2
+#write.table(mean.signif.GBM2, file = paste0(path.tables, "2 - Exp2_GBM_byInoc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+
+
+
+#### Glycerol biomass by proc
+Stats glycerol biomass by proc
+```{r}
+## Tables mean by Proc
+mean.GBM3 <- res.df %>% 
+  group_by(Pr) %>%
+  summarise_at("GBM", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.GBM3
+```
+
+Glycerol biomass significance by proc
+```{r}
+results <- lm(GBM~Pr, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(GBM~Pr, data=res.df)
+
+cld <- cld_desc(aov(GBM ~ Pr, data = res.df), "Pr")
+mean.signif.GBM3 <- mean.GBM3 %>% mutate(Letter = cld[as.character(Pr)])
+mean.signif.GBM3
+#write.table(mean.signif.GBM3, file = paste0(path.tables, "2 - Exp2_GBM_byProc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+
+
+
+
+
+
+
+
+
+
+
+### Fresh vs glycerol
+### Fresh vs glycerol by inoc
+The effect of glycerol is indistinct regardless of In. There is no evidence that more glycerol enters the liquid initiated samples.
+```{r}
+agar_dbm <- res.df$GBM[res.df$In == "Agar"]
+agar_fbm <- res.df$FBM[res.df$In == "Agar"]
+agar_reduction <- agar_dbm/agar_fbm
+mean(agar_reduction)
+sd(agar_reduction)
+
+liquid_dbm <- res.df$GBM[res.df$In == "Liquid"]
+liquid_fbm <- res.df$FBM[res.df$In == "Liquid"]
+liquid_reduction <- liquid_dbm/liquid_fbm
+mean(liquid_reduction)
+sd(liquid_reduction)
+
+reduction_df <- data.frame(reduction = c(agar_reduction, liquid_reduction), In = c(rep("Agar",9), rep("Liquid",9)))
+summary(aov(reduction~In, data=reduction_df))
+```
+
+### Fresh vs glycerol by proc
+
+```{r}
+p1_dbm <- res.df$GBM[res.df$Pr == "B"]
+p1_fbm <- res.df$FBM[res.df$Pr == "B"]
+p1_reduction <- p1_dbm/p1_fbm
+mean(p1_reduction)
+sd(p1_reduction)
+
+p2_dbm <- res.df$GBM[res.df$Pr == "BS"]
+p2_fbm <- res.df$FBM[res.df$Pr == "BS"]
+p2_reduction <- p2_dbm/p2_fbm
+mean(p2_reduction)
+sd(p2_reduction)
+
+p3_dbm <- res.df$GBM[res.df$Pr == "BSB"]
+p3_fbm <- res.df$FBM[res.df$Pr == "BSB"]
+p3_reduction <- p3_dbm/p3_fbm
+mean(p3_reduction)
+sd(p3_reduction)
+
+reduction_df <- data.frame(reduction = c(agar_reduction, liquid_reduction), Pr = c(rep("B",6), rep("BS",6), rep("BSB",6)))
+summary(aov(reduction~Pr, data=reduction_df))
+```
+
+
+## pH
+### pH by level
+Stats pH by level
+```{r}
+## Tables mean by Level
+mean.pH <- res.df %>% 
+  group_by(Levels, New_condition, In, Pr, InN, PrN) %>%
+  summarise_at("pH", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.pH
+```
+
+
+pH biomass significance by level
+```{r}
+results <- lm(pH~In*Pr, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(pH~In*Pr, data=res.df)
+
+cld <- cld_desc(aov(pH ~ Levels, data = res.df), "Levels")
+mean.signif.pH <- mean.pH %>% mutate(Letter = cld[as.character(Levels)])
+mean.signif.pH
+#write.table(mean.signif.pH, file = paste0(path.tables, "2 - Exp2_pH_byLevel_stats.csv"), dec = '.', sep =",", row.names = F)
+
+```
+
+Plot pH by level
+```{r}
+graph_pH <- ggplot(res.df, aes(x = Levels, y = pH, group = Levels, fill = Levels)) +
+  labs(y = "Biomass (g)", x = NULL) +
+  geom_boxplot(lwd = 0.2) +
+  #ylim(c(0, 11)) +
+  scale_fill_manual(name = "", values = my_palette, labels = conditions) +
+  geom_text(data = mean.signif.pH,
+            aes(x = Levels, label = Letter,
+                y = mean* 1.02, group = Levels), colour = "black") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  guides(group = "none", colour = "none", fill = guide_legend(nrow = 1)) +   # <-- single-row legend
+  theme(legend.position = "bottom")
+graph_pH
+#ggsave(paste0(path.figures, "Exp2_pH.svg"), graph_pH, width=10, height=6, units="cm", scale=1.3)
+```
+
+
+### pH biomass by inoc
+Stats pH by inoc
+```{r}
+## Tables mean by Inoc
+mean.pH2 <- res.df %>% 
+  group_by(In, InN) %>%
+  summarise_at("pH", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.pH2
+```
+
+pH significance by inoc
+```{r}
+results <- lm(pH~In, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(pH~In, data=res.df)
+
+# Additive model (pH ~ In): inoculation alone is not significant (p = 0.068), a/a.
+cld <- cld_desc(aov(pH ~ In, data = res.df), "In")
+mean.signif.pH2 <- mean.pH2 %>% mutate(Letter = cld[as.character(In)])
+mean.signif.pH2
+#write.table(mean.signif.pH2, file = paste0(path.tables, "2 - Exp2_pH_byInoc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+
+```{r}
+# Interaction model (pH ~ In*Pr): once process is in the model, inoculation DOES
+# become significant (In p = 0.0045) - Agar (higher pH) differs from Liquid. Kept
+# as its own object, mirroring the by-process additive/interaction pair above.
+cld <- cld_desc(aov(pH ~ In * Pr, data = res.df), "In")
+mean.signif.pH2.int <- mean.pH2 %>% mutate(Letter = cld[as.character(In)])
+mean.signif.pH2.int
+```
+
+
+
+### pH by proc
+Stats pH by proc
+```{r}
+## Tables mean by Proc
+mean.pH3 <- res.df %>% 
+  group_by(Pr) %>%
+  summarise_at("pH", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.pH3
+```
+
+```{r}
+# Interaction model (pH ~ Pr*In): with inoculation in the model the process effect
+# is significant (B and BS differ from BSB). Kept as its own object, as for FBM.
+cld <- cld_desc(aov(pH ~ Pr * In, data = res.df), "Pr")
+mean.signif.pH3.int <- mean.pH3 %>% mutate(Letter = cld[as.character(Pr)])
+mean.signif.pH3.int
+#write.table(mean.signif.pH3.int, file = paste0(path.tables, "2 - Exp2_pH_byProc_interaction_stats.csv"), dec = '.', sep =",", row.names = F)
+
+```
+
+pH significance by proc
+```{r}
+results <- lm(pH~Pr, data=res.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(pH~Pr, data=res.df)
+
+# Additive model (pH ~ Pr): process alone shows NO significant differences (all "a").
+cld <- cld_desc(aov(pH ~ Pr, data = res.df), "Pr")
+mean.signif.pH3 <- mean.pH3 %>% mutate(Letter = cld[as.character(Pr)])
+mean.signif.pH3
+#write.table(mean.signif.pH3, file = paste0(path.tables, "2 - Exp2_pH_byProc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+
+
+
+
+
+
+
+
+
+
+## Surface area from backlit
+### Surface dataframe
+```{r}
+## 11. Load Surface data
+# Surface comes from the ImageJ CSVs in data/processed/grey_values (Exp2_A1..L3);
+# setwd() so surface_read()'s bare-filename reads resolve. Portable via here().
+setwd(path.gv)
+csvs <- list.files(path.gv, pattern = "*.csv")
+csv <- csvs[1]
+scale <- 84.8116 # pixels per cm 
+
+surface_read <- function(csv){
+  csv
+  df <- read.csv(csv, sep = ",", dec = ".") %>%
+    mutate(origin = gsub(".csv","",csv)) %>% # Create a column named origin with the name of the file
+    separate_wider_delim(origin, names = c("Experiment", "Condition"), delim = "_") %>%
+    mutate(Biorep = case_when(XM < 1000 ~ 1,
+                              XM >= 1000 & XM < 2000 ~ 2,
+                              XM >= 2000 ~ 3)) %>%
+    mutate(Radio_px = sqrt(Area/pi),
+           Radio_cm = Radio_px/scale,
+           Area_cm2 = Radio_cm^2*pi,
+           Area_m2 = Area_cm2/10^4,
+           Ident = paste0(Condition, "_", Biorep)) %>%
+    dplyr::select(Condition, Area_m2, Ident) %>%
+    as.data.frame()
+  return(df)
+}
+
+area.df <- do.call(rbind, lapply(csvs, surface_read)) %>%
+  mutate(New_condition = as.factor(Condition),
+         Levels = case_when(
+           Condition == "A1" ~ 1,
+           Condition == "A2" ~ 2,
+           Condition == "A3" ~ 3,
+           Condition == "L1" ~ 4,
+           Condition == "L2" ~ 5,
+           Condition == "L3" ~ 6),
+         Levels = factor(Levels, levels = 1:6),
+         InN = factor(if_else(Levels %in% 1:3, 1, 2)),
+         PrN = factor(case_when(
+           Levels %in% c(1, 4) ~ 1,
+           Levels %in% c(2, 5) ~ 2,
+           Levels %in% c(3, 6) ~ 3)),
+         In = factor(if_else(Levels %in% 1:3,
+                          conditions2[1],
+                          conditions2[2])),
+         Pr = factor(case_when(
+        Levels %in% c(1, 4) ~ conditions3[1],
+        Levels %in% c(2, 5) ~ conditions3[2],
+        Levels %in% c(3, 6) ~ conditions3[3]))) %>%
+  mutate(Surface = Area_m2*10000)
+head(area.df)
+
+
+```
+
+
+### Surface by level
+Stats surface by level
+```{r}
+## Tables mean by Level
+mean.surf <- area.df %>% 
+  group_by(Levels, In, Pr) %>%
+  summarise_at("Surface", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.surf
+```
+
+
+Surface significance by level
+```{r}
+results <- lm(Surface~In*Pr, data=area.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(Surface~In*Pr, data=area.df)
+
+cld <- cld_desc(aov(Surface ~ Levels, data = area.df), "Levels")
+mean.signif.surf <- mean.surf %>% mutate(Letter = cld[as.character(Levels)])
+
+mean.signif.surf
+#write.table(mean.signif.surf, file = paste0(path.tables, "2 - Exp2_surface_byLevel_stats.csv"), dec = '.', sep =",", row.names = F)
+
+```
+
+Plot surface by level
+```{r}
+graph_surf <- ggplot(area.df, aes(x = Levels, y = Surface, group = Levels, fill = Levels)) +
+  labs(y = "Surface (mm2)", x = NULL) +
+  geom_boxplot(lwd = 0.2) +
+  #ylim(c(0, 11)) +
+  scale_fill_manual(name = "", values = my_palette, labels = conditions) +
+  geom_text(data = mean.signif.surf,
+            aes(x = Levels, label = Letter,
+                y = mean + c(0.8, 0.8, 0.8, 1.8, 0.8, 0.8), group = Levels), colour = "black") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  guides(group = "none", colour = "none", fill = guide_legend(nrow = 1)) +   # <-- single-row legend
+  theme(legend.position = "bottom")
+graph_surf
+
+#ggsave(paste0(path.figures, "Exp2_surface.svg"), graph_surf, width=10, height=6, units="cm", scale=1.3)
+```
+
+
+### Surface by inoc
+Stats surface by inoc
+```{r}
+## Tables mean by Inoc
+mean.surf2 <- area.df %>% 
+  group_by(In) %>%
+  summarise_at("Surface", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.surf2
+```
+
+Surface significance by inoc
+```{r}
+results <- lm(Surface~In, data=area.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(Surface~In, data=area.df)
+
+cld <- cld_desc(aov(Surface ~ In, data = area.df), "In")
+mean.signif.surf2 <- mean.surf2 %>% mutate(Letter = cld[as.character(In)])
+mean.signif.surf2
+#write.table(mean.signif.surf2, file = paste0(path.tables, "2 - Exp2_surface_byInoc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+
+
+
+### Surface by proc
+Stats surface by proc
+```{r}
+## Tables mean by Proc
+mean.surf3 <- area.df %>% 
+  group_by(Pr) %>%
+  summarise_at("Surface", list(mean = mean, sd = sd)) %>%
+  as.data.frame()
+mean.surf3
+```
+
+Surface significance by proc
+```{r}
+results <- lm(Surface~Pr, data=area.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(Surface~Pr, data=area.df)
+
+# Additive model (Surface ~ Pr): process alone shows NO significant differences (all "a").
+cld <- cld_desc(aov(Surface ~ Pr, data = area.df), "Pr")
+mean.signif.surf3 <- mean.surf3 %>% mutate(Letter = cld[as.character(Pr)])
+mean.signif.surf3
+#write.table(mean.signif.surf3, file = paste0(path.tables, "2 - Exp2_surface_byProc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+```{r}
+# Interaction model (Surface ~ Pr*In): with inoculation in the model the process
+# effect becomes significant (b b a). Kept as its own object (additive above was
+# non-significant).
+cld <- cld_desc(aov(Surface ~ Pr * In, data = area.df), "Pr")
+mean.signif.surf3.int <- mean.surf3 %>% mutate(Letter = cld[as.character(Pr)])
+mean.signif.surf3.int
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Mechanical data
+
+```{r}
+#setwd(path.raw)
+
+#headers <- c("Time", "Temperature", "Displacement", "Force", "Position", "Length", "Stress", "Strain", "Stiffness", "Modulus", "Compliance", "Pressure")
+```
+
+### Faulted tests (one per Ident_rep)
+Read files
+```{r}
+
+# Mechanical test exports live in data/raw/2 - Mech (path.mech, from the setup
+# chunk). setwd() so csv_read()'s bare-filename reads resolve.
+setwd(path.mech)
+csvs <- list.files(path.mech, pattern = "*.csv")
+csv <- csvs[1]
+
+csv_read <- function(csv) {
+  read.csv(csv, header = FALSE, sep = "\t", skip = 18, nrows = 1, fileEncoding = "UTF-16LE") %>%
+    transmute(Comment = V2, origin = sub("\\.csv$", "", basename(csv))) %>%
+    separate_wider_delim(origin, names = c("Experiment", "Biorep", "Techrep"), delim = "_") %>%
+    separate_wider_delim(Biorep, names = c("Condition", "Biorep"), delim = "-") %>%
+    dplyr::select(Condition, Biorep, Techrep, Comment)
+}
+df <- bind_rows(lapply(csvs, csv_read))
+```
+Dataframe
+```{r}
+df_foul <- df %>%
+  filter(str_detect(Comment, regex("tape|clamp", ignore_case = TRUE))) %>%
+  arrange(Condition, Biorep, Techrep) %>%
+  as.data.frame() %>%
+  mutate(Biorep = as.numeric(gsub("[^0-9]","", Biorep)),
+         Techrep = as.numeric(gsub("[^0-9]","", Techrep))) %>%
+  conditions_bp() %>%
+  dplyr::select(New_condition, Levels, In, InN, Pr, PrN, Biorep, Techrep) %>%
+  filter(row_number() <= n()-1)%>%
+  arrange(Levels, Biorep, Techrep) %>%
+  mutate(Ident = as.factor(paste0(New_condition, "_", Biorep)),
+         Ident_rep = paste0(Ident, "_", Techrep))
+
+# Specimens to exclude from the mechanical analysis. df_foul above is detected
+# automatically from the tester's comment field ("tape"/"clamp"). The hardcoded
+# list below adds tests that visibly failed for a reason not captured by that
+# comment - the specimen slipped in the grips, showed a clamp/edge effect, or
+# had a pre-existing flaw that broke it early - so their stress/strain curves do
+# not reflect the material and are removed by Ident_rep.
+foul_specimens <- unique(c(df_foul$Ident_rep, c("A1_2_3", "L1_3_2", "A1_3_4", "A3_1_4", "L1_2_1", "A3_2_4", "A1_1_3")))
+
+```
+
+### Mechanical data (long per Ident_rep)
+Build database from files
+```{r}
+# 5. Build database from csv
+csvs <- list.files(path.mech, pattern = "*.csv")
+csv <- csvs[1]
+headers <- c("Time", "Temperature", "Displacement", "Force", "Position", "Length", "Stress", "Strain", "Stiffness", "Modulus", "Compliance", "Pressure")
+
+
+csv_read1 <- function(csv){
+  csv
+  df <- read.csv(csv, header = F, sep = "\t", skip = 53, col.names = headers, dec = ".", fileEncoding = "UTF-16LE") %>%
+    dplyr::select(Time, Displacement, Force, Length, Stress, Strain, Stiffness, Modulus) %>%
+    filter(!grepl('StartOfData', Time)) %>%
+    mutate(origin = gsub(".csv","",csv)) %>% # Create a column named origin with the name of the file
+    separate_wider_delim(origin, names = c("Experiment", "Biorep", "Techrep"), delim = "_") %>%
+    separate_wider_delim(Biorep, names = c("Condition", "Biorep"), delim = "-") %>%
+    as.data.frame()
+  return(df)
+}
+```
+
+Adjust dataframe mechanical
+```{r}
+setwd(path.mech)   # portable: data/raw/2 - Mech (bare-filename reads)
+df.mech <- do.call(rbind, lapply(csvs, csv_read1)) %>%
+  conditions_bp() %>%
+  dplyr::select(New_condition, Levels, In, InN, Pr, PrN, Biorep, Techrep, Force, Stress, Strain) %>%
+    mutate(Techrep = as.numeric(gsub("[^0-9]","", Techrep)),
+           Biorep = as.numeric(gsub("[^0-9]","", Biorep)),
+           Stress = as.numeric(Stress),
+           Strain = as.numeric(Strain),
+           Force = as.numeric(Force)) %>%
+    filter(row_number() <= n()-1)%>%
+    arrange(Levels, Biorep, Techrep)
+df.mech$Levels <- factor(df.mech$Levels, levels = c(1, 2, 3, 4, 5, 6))
+df.mech$PrN <- factor(df.mech$PrN, levels = c(1, 2, 3))
+str(df)
+```
+Remove fault tests and last values
+```{r}
+df_mech <- df.mech %>%
+  mutate(Ident = as.factor(paste0(New_condition, "_", Biorep)),
+         Ident_rep = paste0(Ident, "_", Techrep)) %>%
+         #!Ident == "L1_3") %>% # Presumably contaminated biological sample based on transmittance, weight and pH
+  group_by(Ident_rep) %>%
+  filter(row_number() <= n()-1)
+purged_df_mech <- df_mech %>%
+  filter(!Ident_rep %in% foul_specimens)
+```
+
+
+Prepare dataframe for ss plot
+```{r}
+# 6. Preparation of the dataset.
+# Row-level cleaning of the raw mechanical curves (purged dataset - foul specimens
+# excluded - used for all the significance analyses): drop rows with missing or
+# negative stress/strain, and keep the loading branch by discarding points where
+# strain falls back relative to the previous row (after the first 10 rows of each
+# specimen).
+ss.df <- purged_df_mech %>%
+  group_by(Ident_rep) %>%
+  mutate(row_id = row_number()) %>%
+  filter(!if_any(c(Strain, Stress), is.na),
+         Strain >= 0,
+         Stress >= 0,
+         row_id <= 10 | is.na(lag(Strain)) | Strain <= 1.05 * lag(Strain)) %>%
+  dplyr::select(-row_id) %>%
+  ungroup() %>%
+  as.data.frame()
+
+#str(ss.df)
+#write.table(ss.df, file = paste0(path.tables, "3 - Exp2_ss.csv"), dec = '.', sep =",", row.names = F)
+
+```
+
+SSplot
+```{r}
+graph_ss <- ggplot(data = ss.df, aes(x = Strain, y = Stress, group = as.factor(Ident_rep), colour = as.factor(Levels))) +
+  geom_line(linewidth = .3) +
+  scale_colour_manual(name = "Inoculation method", values = my_palette,
+                      labels = conditions) +
+  scale_x_continuous(limits = c(-0, 40)) +
+  labs(x = "Strain [%]",
+       y = "Stress [MPa]") +
+  theme(legend.position = "bottom") +
+  guides(colour = guide_legend(nrow = 1))
+graph_ss
+ggsave(paste0(path.figures, "S1. Exp2_ss.svg"), graph_ss, width=10, height=6, units="cm", scale=1.8)
+
+```
+
+
+
+
+## Thickness from specimens
+
+### Thickness dataframe
+```{r}
+setwd(path.mech)                                  # portable: data/raw/2 - Mech
+csvs <- list.files(path.mech, pattern = "*.csv")
+csv <- csvs[1]
+
+## 9. Thickness data from cvs
+thickness_read <- function(csv){
+  csv
+  df <- read.csv(csv, header = F, sep = "\t", dec = ".", nrows = 1, skip = 15, fileEncoding = "UTF-16LE")[4] %>%
+    mutate(origin = gsub(".csv","",csv)) %>% # Create a column named origin with the name of the file
+    separate_wider_delim(origin, names = c("Experiment", "Biorep", "Techrep"), delim = "_") %>%
+    separate_wider_delim(Biorep, names = c("Condition", "Biorep"), delim = "-") %>%
+    as.data.frame() %>%
+    mutate(Techrep = as.numeric(gsub("[^0-9]","", Techrep)),
+           Biorep = as.numeric(gsub("[^0-9]","", Biorep))) %>%
+    conditions_bp() %>%
+    mutate(Ident = paste0(New_condition, "_", Biorep),
+           Ident_rep = paste0(New_condition, "_", Biorep, "_", Techrep))
+return(df)
+}
+
+df.thick <- do.call(rbind, lapply(csvs, thickness_read))
+```
+
+Prepare dataframe
+```{r}
+df_thick <- df.thick %>%
+  mutate(Ident = as.factor(paste0(New_condition, "_", Biorep)),
+         Ident_rep = paste0(Ident, "_", Techrep)) %>%
+  rename(Thickness = V4) %>%
+  mutate(Ident_rep = as.factor(Ident_rep))
+purged_thickness_df <- df_thick %>%
+  filter(!Ident_rep %in% foul_specimens)
+#write.table(purged_thickness_df, file = paste0(path.tables, "Exp2_Thickness_techrep.csv"), dec = '.', sep=",", row.names = F)
+
+# Number of specimens per biorep
+purged_thickness_df %>%
+  count(Ident)
+
+```
+
+### Thickness by level
+Stats thickness by level
+```{r}
+## Tables mean by Level
+mean.thick <- purged_thickness_df %>% 
+  group_by(Levels) %>%
+  summarise(n_rep   = n_distinct(Ident_rep),
+            median = median(Thickness),
+            sd = sd(Thickness)) %>%
+  as.data.frame()
+mean.thick
+```
+
+
+Thickness significance by level
+```{r}
+results <- lm(Thickness~In*Pr, data=purged_thickness_df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(Thickness~In*Pr, data=purged_thickness_df)
+
+# Non-parametric (pairwise Wilcoxon, BH): letters ordered by descending median.
+cld <- cld_wilcox_desc(purged_thickness_df$Thickness, purged_thickness_df$Levels)
+mean.signif.thick <- mean.thick %>% mutate(Letter = cld[as.character(Levels)])
+mean.signif.thick
+#write.table(mean.signif.thick, file = paste0(path.tables, "2 - Exp2_thickness_byLevel_stats.csv"), dec = '.', sep =",", row.names = F)
+
+```
+
+Plot thickness by level
+```{r}
+graph_thick <- ggplot(purged_thickness_df, aes(x = Levels, y = Thickness, group = Levels, fill = Levels)) +
+  labs(y = "Thickness (mm)", x = NULL) +
+  geom_boxplot(lwd = 0.2) +
+  #ylim(c(0, 11)) +
+  scale_fill_manual(name = "", values = my_palette, labels = conditions) +
+  geom_text(data = mean.signif.thick,
+            aes(x = Levels, label = Letter,
+                y = median + c(0.8, 0.8, 0.8, 1.8, 0.8, 0.8), group = Levels), colour = "black") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  guides(group = "none", colour = "none", fill = guide_legend(nrow = 1)) +   # <-- single-row legend
+  theme(legend.position = "bottom")
+graph_thick
+#ggsave(paste0(path.figures, "Exp2_thick.svg"), graph_thick, width=10, height=6, units="cm", scale=1.3)
+```
+
+
+### Thickness by inoc
+Stats thickness by inoc
+```{r}
+## Tables mean by Inoc
+mean.thick2 <- purged_thickness_df %>% 
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(In) %>%
+  summarise(n_rep   = n_distinct(Ident_rep),
+            median = median(Thickness),
+            sd = sd(Thickness)) %>%
+  as.data.frame()
+
+mean.thick2
+```
+
+Thickness significance by inoc
+```{r}
+results <- lm(Thickness~In, data=purged_thickness_df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(Thickness~In, data=purged_thickness_df)
+
+# Non-parametric, 2 groups: letters ordered by descending median (a = highest).
+pv <- pairwise.wilcox.test(purged_thickness_df$Thickness, purged_thickness_df$In, p.adjust.method = "BH")$p.value
+mean.signif.thick2 <- mean.thick2 %>%
+  mutate(Letter = cld_median2(pv[!is.na(pv)][1], purged_thickness_df$Thickness, purged_thickness_df$In)[as.character(In)])
+mean.signif.thick2
+#write.table(mean.signif.thick2, file = paste0(path.tables, "2 - Exp2_thickness_byInoc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+
+
+### Thickness by proc
+Stats thickness by proc
+```{r}
+## Tables mean by Proc
+mean.thick3 <- purged_thickness_df %>%
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(Pr) %>%
+  summarise(n_rep   = n_distinct(Ident_rep),
+            median = median(Thickness),
+            sd = sd(Thickness)) %>%
+  as.data.frame()
+mean.thick3
+```
+
+Thickness significance by proc
+```{r}
+results <- lm(Thickness~Pr, data=purged_thickness_df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(Thickness~Pr, data=purged_thickness_df)
+
+# Non-parametric (pairwise Wilcoxon, BH): letters ordered by descending median.
+cld <- cld_wilcox_desc(purged_thickness_df$Thickness, purged_thickness_df$Pr)
+mean.signif.thick3 <- mean.thick3 %>% mutate(Letter = cld[as.character(Pr)])
+mean.signif.thick3
+#write.table(mean.signif.thick3, file = paste0(path.tables, "2 - Exp2_thickness_byProc_stats.csv"), dec = '.', sep =",", row.names = F)
+```
+
+
+
+
+
+## Ultimate strength
+### Load data and dataframe
+```{r}
+ultstr.df <- ss.df %>%
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>% 
+  ungroup()
+ultstr.df
+```
+
+Mean dataframe
+```{r}
+
+median.ultstr.df <- ultstr.df %>%
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(Levels) %>%
+  summarise(n_rep   = n_distinct(Ident_rep),
+            median = median(Stress),
+            sd = sd(Stress)) %>%
+  as.data.frame()
+median.ultstr.df
+
+```
+### Significance UTS per level
+```{r}
+# 12.1 Significance ultimate strength per condition
+results <- lm(Stress~Levels, data=ultstr.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Stress~Levels, data=ultstr.df)
+
+# Non-parametric (pairwise Wilcoxon, BH): letters ordered by descending median.
+cld <- cld_wilcox_desc(ultstr.df$Stress, ultstr.df$Levels)
+median.ultstr.signif <- median.ultstr.df %>% mutate(Letter = cld[as.character(Levels)])
+#write.table(median.ultstr.signif, file = paste0(path.tables, "5 - Exp2_ultrstr_median.csv"), dec = '.', sep =",", row.names = F)
+median.ultstr.signif
+```
+Plot UTS per level
+```{r}
+graph_ultstr_dp <- ggplot(data = ultstr.df, aes(x = Levels, y = Stress, group = Levels, fill = Levels)) +
+  labs(y = "Ultimate strength [MPa]", x = NULL) +
+  geom_boxplot(lwd = 0.5) +
+  scale_fill_manual(name = "Condition", values = my_palette, labels = conditions) +
+  geom_text(data = median.ultstr.signif, aes(x = Levels, label = Letter, y = median + c(0.29, 0.22, 0.25, 0.3, 0.2, 0.16), group = Levels), colour = "black") +
+  geom_jitter(size = 0.5) +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  theme(legend.position = "none")
+graph_ultstr_dp
+#ggsave(paste0(path.figures, "Exp2_US_datapoints.svg"), graph_ultstr_dp, width=10, height=6, units="cm", scale=1.5)
+
+graph_ultstr <- ggplot(data = ultstr.df, aes(x = Levels, y = Stress, group = Levels, fill = Levels)) +
+  labs(y = "Ultimate strength [MPa]", x = NULL) +
+  geom_boxplot(lwd = 0.2, outlier.size=0.2) +
+  scale_fill_manual(name = "Condition", values = my_palette, labels = conditions) +
+  geom_text(data = median.ultstr.signif, aes(x = Levels, label = Letter, y = median + c(0.29, 0.22, 0.25, 0.3, 0.2, 0.16), group = Levels), colour = "black") +
+  #geom_jitter(size = 0.5) +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  theme(legend.position = "none")
+graph_ultstr
+# figures already go to path.figures (results/figures), set in the setup chunk
+ggsave(paste0(path.figures, "2. Exp2_US.svg"), graph_ultstr, width=7, height=6, units="cm", scale=1.3)
+```
+
+### Significance UTS per Inoc
+```{r}
+# 12.2 Significance ultimate strength per inoc
+median.ultstr.df2 <- ultstr.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(In) %>%
+  summarise(n_rep   = n_distinct(Ident_rep),
+            median = median(Stress),
+            sd = sd(Stress)) %>%
+  as.data.frame()
+median.ultstr.df2
+```
+
+
+```{r}
+results <- lm(Stress~In, data=ultstr.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Stress~In, data=ultstr.df)
+
+kruskal.test(Stress ~ In, data = ultstr.df)
+# Non-parametric, 2 groups: letters ordered by descending median (a = highest).
+pv <- pairwise.wilcox.test(ultstr.df$Stress, ultstr.df$In, p.adjust.method = "BH")$p.value
+median.ultstr.signif2 <- median.ultstr.df2 %>%
+  mutate(Letter = cld_median2(pv[!is.na(pv)][1], ultstr.df$Stress, ultstr.df$In)[as.character(In)])
+median.ultstr.signif2
+```
+
+### Significance UTS per Proc
+```{r}
+# 12.3 Significance ultimate strength per proc
+median.ultstr.df3 <- ultstr.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(Pr) %>%
+  summarise(n_rep   = n_distinct(Ident_rep),
+            median = median(Stress),
+            sd = sd(Stress)) %>%
+  as.data.frame()
+median.ultstr.df3
+```
+
+
+```{r}
+results <- lm(Stress~Pr, data=ultstr.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Stress~Pr, data=ultstr.df)
+
+kruskal.test(Stress ~ Pr, data = ultstr.df)
+# Non-parametric (pairwise Wilcoxon, BH): letters ordered by descending median.
+cld <- cld_wilcox_desc(ultstr.df$Stress, ultstr.df$Pr)
+median.ultstr.signif3 <- median.ultstr.df3 %>% mutate(Letter = cld[as.character(Pr)])
+
+```
+
+
+
+
+## Force
+### Significance Force per level
+```{r}
+# 12.1 Significance force per condition
+median.force.df <- ultstr.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(Levels) %>%
+  summarise(
+    n_rep   = n_distinct(Ident_rep),
+    median = median(Force),
+    sd = sd(Force)) %>%
+  as.data.frame()
+median.force.df
+```
+
+
+```{r}
+results <- lm(Force~Levels, data=ultstr.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Force~Levels, data=ultstr.df)
+
+# Non-parametric (pairwise Wilcoxon, BH): letters ordered by descending median.
+cld <- cld_wilcox_desc(ultstr.df$Force, ultstr.df$Levels)
+median.force.signif <- median.force.df %>% mutate(Letter = cld[as.character(Levels)])
+#write.table(median.force.signif, file = paste0(path.tables, "5 - Exp2_force_median.csv"), dec = '.', sep =",", row.names = F)
+```
+Plot Strain per level
+```{r}
+graph_force_dp <- ggplot(data = ultstr.df, aes(x = Levels, y = Force, group = Levels, fill = Levels)) +
+  labs(y = "Strain %", x = NULL) +
+  geom_boxplot(lwd = 0.5) +
+  scale_fill_manual(name = "Condition", values = my_palette, labels = conditions) +
+  geom_text(data = median.force.signif, aes(x = Levels, label = Letter, y = median + c(0.29, 0.22, 0.25, 0.3, 0.2, 0.16), group = Levels), colour = "black") +
+  geom_jitter(size = 0.5) +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  theme(legend.position = "none")
+graph_force_dp
+#ggsave(paste0(path.figures, "Exp2_force_datapoints.svg"), graph_force_dp, width=10, height=6, units="cm", scale=1.5)
+
+graph_force <- ggplot(data = ultstr.df, aes(x = Levels, y = Force, group = Levels, fill = Levels)) +
+  labs(y = "Force (N)", x = NULL) +
+  geom_boxplot(lwd = 0.5) +
+  scale_fill_manual(name = "Condition", values = my_palette, labels = conditions) +
+  geom_text(data = median.force.signif, aes(x = Levels, label = Letter, y = median + c(0.29, 0.22, 0.25, 0.3, 0.2, 0.16), group = Levels), colour = "black") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  theme(legend.position = "none")
+graph_force
+#ggsave(paste0(path.figures, "Exp2_force.svg"), graph_force, width=10, height=6, units="cm", scale=1.5)
+```
+
+### Significance Force per Inoc
+```{r}
+# 12.2 Significance force per inoc
+median.force.df2 <- ultstr.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(In) %>%
+  summarise(
+    n_rep   = n_distinct(Ident_rep),
+    median = median(Force),
+    sd = sd(Force)) %>%
+  as.data.frame()
+median.force.df2
+```
+
+
+```{r}
+results <- lm(Force~In, data=ultstr.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Force~In, data=ultstr.df)
+
+kruskal.test(Force ~ In, data = ultstr.df)
+# Non-parametric, 2 groups: letters ordered by descending median (a = highest).
+pv <- pairwise.wilcox.test(ultstr.df$Force, ultstr.df$In, p.adjust.method = "BH")$p.value
+median.force.signif2 <- median.force.df2 %>%
+  mutate(Letter = cld_median2(pv[!is.na(pv)][1], ultstr.df$Force, ultstr.df$In)[as.character(In)])
+
+```
+
+### Significance Force per Proc
+```{r}
+# 12.3 Significance force per proc
+median.force.df3 <- ultstr.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(Pr) %>%
+  summarise(
+    n_rep   = n_distinct(Ident_rep),
+    median = median(Force),
+    sd = sd(Force)) %>%
+  as.data.frame()
+median.force.df3
+```
+
+
+```{r}
+results <- lm(Force~Pr, data=ultstr.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Force~Pr, data=ultstr.df)
+
+kruskal.test(Force ~ Pr, data = ultstr.df)
+# Non-parametric (pairwise Wilcoxon, BH): letters ordered by descending median.
+cld <- cld_wilcox_desc(ultstr.df$Force, ultstr.df$Pr)
+median.force.signif3 <- median.force.df3 %>% mutate(Letter = cld[as.character(Pr)])
+
+```
+
+
+
+
+
+
+
+
+## Stats Strain
+### Significance Strain per level
+```{r}
+# 12.1 Significance strain per condition
+median.strain.df <- ultstr.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(Levels) %>%
+  summarise(
+    n_rep   = n_distinct(Ident_rep),
+    median = median(Strain),
+    sd = sd(Strain)) %>%
+  as.data.frame()
+median.strain.df
+```
+
+
+```{r}
+results <- lm(Strain~Levels, data=ultstr.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Strain~Levels, data=ultstr.df)
+
+# Non-parametric (pairwise Wilcoxon, BH): letters ordered by descending median.
+cld <- cld_wilcox_desc(ultstr.df$Strain, ultstr.df$Levels)
+median.strain.signif <- median.strain.df %>% mutate(Letter = cld[as.character(Levels)])
+#write.table(median.strain.signif, file = paste0(path.tables, "5 - Exp2_strain_median.csv"), dec = '.', sep =",", row.names = F)
+```
+Plot Strain per level
+```{r}
+graph_strain_dp <- ggplot(data = ultstr.df, aes(x = Levels, y = Strain, group = Levels, fill = Levels)) +
+  labs(y = "Strain %", x = NULL) +
+  geom_boxplot(lwd = 0.5) +
+  scale_fill_manual(name = "Condition", values = my_palette, labels = conditions) +
+  geom_text(data = median.strain.signif, aes(x = Levels, label = Letter, y = median + c(0.29, 0.22, 0.25, 0.3, 0.2, 0.16), group = Levels), colour = "black") +
+  geom_jitter(size = 0.5) +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  theme(legend.position = "none")
+graph_strain_dp
+#ggsave(paste0(path.figures, "Exp2_strain_datapoints.svg"), graph_strain_dp, width=10, height=6, units="cm", scale=1.5)
+
+graph_strain <- ggplot(data = ultstr.df, aes(x = Levels, y = Strain, group = Levels, fill = Levels)) +
+  labs(y = "Strain %", x = NULL) +
+  geom_boxplot(lwd = 0.5) +
+  scale_fill_manual(name = "Condition", values = my_palette, labels = conditions) +
+  geom_text(data = median.strain.signif, aes(x = Levels, label = Letter, y = median + c(0.29, 0.22, 0.25, 0.3, 0.2, 0.16), group = Levels), colour = "black") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  theme(legend.position = "none")
+graph_strain
+#ggsave(paste0(path.figures, "Exp2_strain.svg"), graph_strain, width=10, height=6, units="cm", scale=1.5)
+```
+
+### Significance Strain per Inoc
+```{r}
+# 12.2 Significance strain per inoc
+median.strain.df2 <- ultstr.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(In) %>%
+  summarise(
+    n_rep   = n_distinct(Ident_rep),
+    median = median(Strain),
+    sd = sd(Strain)) %>%
+  as.data.frame()
+median.strain.df2
+```
+
+
+```{r}
+results <- lm(Strain~In, data=ultstr.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Strain~In, data=ultstr.df)
+
+kruskal.test(Strain ~ In, data = ultstr.df)
+# Non-parametric, 2 groups: letters ordered by descending median (a = highest).
+pv <- pairwise.wilcox.test(ultstr.df$Strain, ultstr.df$In, p.adjust.method = "BH")$p.value
+median.strain.signif2 <- median.strain.df2 %>%
+  mutate(Letter = cld_median2(pv[!is.na(pv)][1], ultstr.df$Strain, ultstr.df$In)[as.character(In)])
+
+```
+
+### Significance Strain per Proc
+```{r}
+# 12.3 Significance strain per proc
+median.strain.df3 <- ultstr.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(Pr) %>%
+  summarise(
+    n_rep   = n_distinct(Ident_rep),
+    median = median(Strain),
+    sd = sd(Strain)) %>%
+  as.data.frame()
+median.strain.df3
+```
+
+
+```{r}
+results <- lm(Strain~Pr, data=ultstr.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Strain~Pr, data=ultstr.df)
+
+kruskal.test(Strain ~ Pr, data = ultstr.df)
+# Non-parametric (pairwise Wilcoxon, BH): letters ordered by descending median.
+cld <- cld_wilcox_desc(ultstr.df$Strain, ultstr.df$Pr)
+median.strain.signif3 <- median.strain.df3 %>% mutate(Letter = cld[as.character(Pr)])
+
+```
+
+
+
+
+
+
+
+
+
+
+
+## Stats Density
+### Dataframe
+```{r}
+thick_biorep <- purged_thickness_df %>%
+  group_by(Ident) %>%
+  summarise(
+    n_rep   = n_distinct(Ident_rep),
+    thickness = median(Thickness)) %>%
+  as.data.frame()
+  
+density.df <- res.df %>%
+  left_join(area.df, by = "Ident", suffix = c("", ".dup")) %>%
+  left_join(thick_biorep, by = "Ident", suffix = c("", ".dup")) %>%
+  select(-ends_with(".dup")) %>%
+  mutate(Volume = thickness / 1000 * Area_m2,
+         Density = (GBM / 1000) / Volume)
+
+```
+
+### Significance density per level
+```{r}
+# 12.1 Significance density per condition
+median.density.df <- density.df %>% # Assign homogeneous groups
+  group_by(Levels) %>%
+  summarise(
+    density_median = median(Density),
+    density_sd = sd(Density),
+    volume_mean = mean(Volume),
+    volume_sd = sd(Volume),
+    ) %>%
+  as.data.frame()
+median.density.df
+```
+
+
+```{r}
+results <- lm(Density~Levels, data=density.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Density~Levels, data=density.df)
+
+# Non-parametric (pairwise Wilcoxon, BH): compact letters ordered by descending
+# median (a = highest).
+cld <- cld_wilcox_desc(density.df$Density, density.df$Levels)
+median.density.signif <- median.density.df %>% mutate(Letter = cld[as.character(Levels)])
+#write.table(median.density.signif, file = paste0(path.tables, "5 - Exp2_density_median.csv"), dec = '.', sep =",", row.names = F)
+```
+Plot Density per level
+```{r}
+graph_density_dp <- ggplot(data = density.df, aes(x = Levels, y = Density, group = Levels, fill = Levels)) +
+  labs(y = "Density [kg/m3]", x = NULL) +
+  geom_boxplot(lwd = 0.5) +
+  scale_fill_manual(name = "Condition", values = my_palette, labels = conditions) +
+  geom_text(data = median.density.signif, aes(x = Levels, label = Letter, y = density_median + c(0.29, 0.22, 0.25, 0.3, 0.2, 0.16), group = Levels), colour = "black") +
+  geom_jitter(size = 0.5) +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  theme(legend.position = "none")
+graph_density_dp
+#ggsave(paste0(path.figures, "Exp2_density_datapoints.svg"), graph_density_dp, width=10, height=6, units="cm", scale=1.5)
+
+graph_density <- ggplot(data = density.df, aes(x = Levels, y = Density, group = Levels, fill = Levels)) +
+  labs(y = "Density [kg/m3]", x = NULL) +
+  geom_boxplot(lwd = 0.5) +
+  scale_fill_manual(name = "Condition", values = my_palette, labels = conditions) +
+  geom_text(data = median.density.signif, aes(x = Levels, label = Letter, y = density_median + c(0.29, 0.22, 0.25, 0.3, 0.2, 0.16), group = Levels), colour = "black") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  theme(legend.position = "none")
+graph_density
+#ggsave(paste0(path.figures, "Exp2_density.svg"), graph_density, width=10, height=6, units="cm", scale=1.5)
+```
+
+### Significance density per Inoc
+```{r}
+# 12.2 Significance density per inoc
+median.density.df2 <- density.df %>% # Assign homogeneous groups
+  group_by(In) %>%
+  summarise(
+    n_rep   = n_distinct(Ident),
+    median = median(Density),
+    sd = sd(Density)) %>%
+  as.data.frame()
+median.density.df2
+```
+
+
+```{r}
+results <- lm(Density~In, data=density.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Density~In, data=density.df)
+
+kruskal.test(Density ~ In, data = density.df)
+
+# Non-parametric, 2 groups: letters ordered by descending median (a = highest).
+pv <- pairwise.wilcox.test(density.df$Density, density.df$In, p.adjust.method = "BH")$p.value
+median.density.signif2 <- median.density.df2 %>%
+  mutate(Letter = cld_median2(pv[!is.na(pv)][1], density.df$Density, density.df$In)[as.character(In)])
+
+```
+
+### Significance density per Proc
+```{r}
+# 12.3 Significance density per proc
+median.density.df3 <- density.df %>% # Assign homogeneous groups
+  group_by(Pr) %>%
+  summarise(
+    n_rep   = n_distinct(Ident),
+    median = median(Density),
+    sd = sd(Density)) %>%
+  as.data.frame()
+median.density.df3
+```
+
+
+```{r}
+results <- lm(Density~Pr, data=density.df)
+plot(results,which=2)
+shapiro.test(residuals(results)) # Not normally distributed -> Non parametric test
+leveneTest(Density~Pr, data=density.df)
+
+kruskal.test(Density ~ Pr, data = density.df)
+# Non-parametric (pairwise Wilcoxon, BH), letters ordered by descending median.
+cld <- cld_wilcox_desc(density.df$Density, density.df$Pr)
+median.density.signif3 <- median.density.df3 %>% mutate(Letter = cld[as.character(Pr)])
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+## Youngs modulus 
+### Dataframe
+```{r}
+# 8. Youngs dataframe
+
+youngs.df <- ss.df %>%
+  mutate(New_strain = Strain/100) %>%
+  group_by(Ident_rep, Ident, In, InN, Pr, PrN, New_condition, Biorep, Levels) %>%
+  filter(Strain > 1 & Strain < 10) %>%
+  do(tidy(lm(Stress ~ New_strain, data = .))) %>%
+  group_by(Ident_rep, Ident, In, InN, Pr, PrN, New_condition, Biorep, Levels) %>%
+  filter(term == "New_strain") %>%
+  as.data.frame()
+head(youngs.df)
+#write.table(youngs.df, file = paste0(path.tables, "3 - Exp2_youngs.csv"), dec = '.', sep =",", row.names = F)
+
+```
+
+
+
+### YM by level
+Stats dataframe
+```{r}
+median.youngs.df <- youngs.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(Levels) %>%
+  summarise(
+    n_rep   = n_distinct(Ident_rep),
+    median = median(estimate),
+    sd = sd(estimate)) %>%
+  as.data.frame()
+median.youngs.df
+```
+
+Significance by level
+```{r}
+## 10.1 Significant differences by level
+results <- lm(estimate~Levels, data=youngs.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(estimate~Levels, data=youngs.df) # Not normally distributed -> Non parametric test
+
+#scheirerRayHare(estimate ~ In + Pr + In:Pr, data = youngs.df)
+#dunnTest(estimate ~ Pr, data = youngs.df, method = "bh")
+kruskal.test(estimate ~ Levels, data = youngs.df) # All factors
+# Non-parametric (pairwise Wilcoxon, BH): letters ordered by descending median.
+cld <- cld_wilcox_desc(youngs.df$estimate, youngs.df$Levels)
+median.youngs.signif <- median.youngs.df %>% mutate(Letter = cld[as.character(Levels)])
+median.youngs.signif
+#write.table(median.youngs.signif, file = paste0(path.tables, "4 - Exp2_youngs_median.csv"), dec = '.', sep =",", row.names = F)
+
+```
+Plot YM by level
+```{r}
+graph_youngs <- ggplot(data = youngs.df, aes(x = Levels, y = estimate, group = Levels, fill = Levels)) +
+  labs(y = "Young's modulus [MPa]", x = NULL) +
+  geom_boxplot() +
+  scale_fill_manual(name = "Condition", values = my_palette, labels = conditions) +
+  geom_text(data = median.youngs.signif, aes(x = Levels, label = Letter, y = median + c(1.5, 1.5, 1.5, 2, 1, 1), group = Levels), colour = "black") +
+  #geom_signif(y_position = c(210, 195, 195, 210, 210, 220), xmin = c(2.05, 1, 3.05, 1, 2.05, 1), 
+  #            xmax = c(2.95, 2.95, 4, 1.95, 4, 4), annotation = c("NS", "***", "NS", "***", "**", "***"),
+  #            tip_length = c(0.01, 0.01), vjust = .3) +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  theme(legend.position = "none")
+graph_youngs
+#ggsave(paste0(path.figures, "Exp2_YM.svg"), graph_youngs, width=10, height=6, units="cm", scale=1.5)
+```
+
+
+### YM by Inoc
+```{r}
+median.youngs.df2 <- youngs.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(In) %>%
+  summarise(
+    n_rep   = n_distinct(Ident_rep),
+    median = median(estimate),
+    sd = sd(estimate)) %>%
+  as.data.frame()
+median.youngs.df2
+```
+
+
+```{r}
+results <- lm(estimate~In, data=youngs.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(estimate~In, data=youngs.df) # Not normally distributed -> Non parametric test
+
+kruskal.test(estimate ~ In, data = youngs.df)
+# Non-parametric, 2 groups: letters ordered by descending median (a = highest).
+pv <- pairwise.wilcox.test(youngs.df$estimate, youngs.df$In, p.adjust.method = "BH")$p.value
+median.youngs.signif2 <- median.youngs.df2 %>%
+  mutate(Letter = cld_median2(pv[!is.na(pv)][1], youngs.df$estimate, youngs.df$In)[as.character(In)])
+median.youngs.signif2
+
+```
+
+```{r}
+median.youngs.df3 <- youngs.df %>% # Assign homogeneous groups
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>%      # keep last row per replicate
+  ungroup() %>%
+  group_by(Pr) %>%
+  summarise(
+    n_rep   = n_distinct(Ident_rep),
+    median = median(estimate),
+    sd = sd(estimate)) %>%
+  as.data.frame()
+median.youngs.df3
+```
+
+
+```{r}
+results <- lm(estimate~Pr, data=youngs.df)
+plot(results,which=2)
+shapiro.test(residuals(results))
+leveneTest(estimate~Pr, data=youngs.df) # Not normally distributed -> Non parametric test
+
+kruskal.test(estimate ~ Pr, data = youngs.df) # All factors
+# Non-parametric (pairwise Wilcoxon, BH): letters ordered by descending median.
+# B and BS do not differ (p = 0.89) so they share a letter; BSB differs from both
+# (p < 0.001).
+cld <- cld_wilcox_desc(youngs.df$estimate, youngs.df$Pr)
+median.youngs.signif3 <- median.youngs.df3 %>% mutate(Letter = cld[as.character(Pr)])
+median.youngs.signif3
+```
+
+
+
+
+
+## PCA
+### Reload data without purging
+```{r}
+## Mechanical data
+# This PCA / material-family section rebuilds the mechanical dataset from the
+# UNPURGED curves (df_mech) on purpose: it keeps the foul specimens and instead
+# drops only the few listed in remove_specimens below. It also rebuilds ultstr.df
+# and youngs.df from this unpurged data; that does not affect the significance
+# results, which are all computed earlier in the script. The row-level cleaning
+# below is the same as for ss.df.
+ss.df1 <- df_mech %>%
+  group_by(Ident_rep) %>%
+  mutate(row_id = row_number()) %>%
+  filter(!if_any(c(Strain, Stress), is.na),
+         Strain >= 0,
+         Stress >= 0,
+         row_id <= 10 | is.na(lag(Strain)) | Strain <= 1.05 * lag(Strain)) %>%
+  dplyr::select(-row_id) %>%
+  ungroup() %>%
+  as.data.frame()
+
+## Thickness
+df_thick
+
+## UTS
+ultstr.df <- ss.df1 %>%
+  group_by(Ident_rep) %>%
+  filter(row_number() == n()) %>% 
+  ungroup()
+
+## YM
+youngs.df <- ss.df1 %>%
+  mutate(New_strain = Strain/100) %>%
+  group_by(Ident_rep, Ident, In, InN, Pr, PrN, New_condition, Biorep, Levels) %>%
+  filter(Strain > 1 & Strain < 10) %>%
+  do(tidy(lm(Stress ~ New_strain, data = .))) %>%
+  group_by(Ident_rep, Ident, In, InN, Pr, PrN, New_condition, Biorep, Levels) %>%
+  filter(term == "New_strain") %>%
+  rename(YM = estimate) %>%
+  as.data.frame()
+
+prepca_df <- df_thick %>%
+  left_join(ultstr.df, by = "Ident_rep", suffix = c("", ".dup")) %>%
+  left_join(youngs.df, by = "Ident_rep", suffix = c("", ".dup")) %>%
+  left_join(area.df, by = "Ident", suffix = c("", ".dup")) %>%
+  left_join(res.df, by = "Ident", suffix = c("", ".dup")) %>%
+  select(-ends_with(".dup"))
+
+remove_specimens <- c("A1_1_3", "A1_2_3", "A1_3_4", "L1_2_1", "L1_3_2", "L3_2_3")
+
+prepca_df <- prepca_df %>%
+  filter(!Ident_rep %in% remove_specimens)
+
+vol.df <- prepca_df %>%
+  group_by(Ident) %>%
+  mutate(Volume = Area_m2 * (Thickness/1000)) %>%
+  summarise(Volume = mean(Volume))%>%
+  as.data.frame()
+
+pca_df <- left_join(prepca_df, vol.df, "Ident") %>%
+  mutate(Density = (GBM / 1000) / Volume) %>%
+  dplyr::select("New_condition", "Levels", "In", "Pr", "InN", "PrN", "Ident", "Ident_rep", "pH", "FBM", "GBM", "Area_m2", "Thickness", "Volume", "Density", "Force", "Stress", "Strain", "YM")
+str(pca_df)
+
+```
+
+## Thickness and force
+```{r}
+# figures -> path.figures (results/figures), set in the setup chunk
+
+eq_df <- pca_df %>%
+  group_by(In) %>%
+  do({
+    m <- lm(Force ~ Thickness, data = .)
+    data.frame(label = sprintf("y = %.2fx + %.2f\nR² = %.2f", coef(m)[2], coef(m)[1], summary(m)$r.squared),
+      x = max(.$Thickness), y = max(.$Force))
+    })
+
+ForceThickness <- ggplot(data = pca_df, aes(Thickness, Force)) +
+  labs(x = "Thickness [mm]", y = "Force [N]")
+
+lm_in_ForceThickness <- ForceThickness +
+  geom_point(shape = 21, alpha = 0.8, aes(colour = In)) +
+  geom_smooth(method = "lm", se = FALSE, aes(colour = In)) +
+  geom_text(data = eq_df, aes(x = x, y = y, label = label, colour = In), hjust = 1, vjust = 1) + 
+  scale_colour_manual(name = "Condition", values = my_palette2, labels = conditions2)
+lm_in_ForceThickness
+#ggsave(paste0(path.figures, "Exp2_force&thickness_in.svg"), lm_in_ForceThickness, width=10, height=6, units="cm", scale=1.5)
+
+
+eq_df <- pca_df %>%
+  group_by(Pr) %>%
+  do({
+    m <- lm(Force ~ Thickness, data = .)
+    data.frame(label = sprintf("y = %.2fx + %.2f\nR² = %.2f", coef(m)[2], coef(m)[1], summary(m)$r.squared))
+    }) %>%
+  as.data.frame() %>%
+  mutate(y = c(7, 10, 8.5), 
+         x = 3)
+
+lm_pr_ForceThickness <- ForceThickness +
+  geom_point(shape = 21, alpha = 0.8, aes(colour = Pr)) +
+  geom_smooth(method = "lm", se = FALSE, aes(colour = Pr)) +
+  geom_text(data = eq_df, aes(x = x, y = y, label = label, colour = Pr), hjust = 1, vjust = 1) + 
+  scale_colour_manual(name = "Condition", values = my_palette3[c(1,3,2)], labels = conditions3[c(1,3,2)])
+lm_pr_ForceThickness
+ggsave(paste0(path.figures, "S3. Exp2_force&thickness.svg"), lm_pr_ForceThickness, width=10, height=6, units="cm", scale=1.5)
+
+
+
+cor.test(pca_df$Thickness, pca_df$Stress)
+cor.test(pca_df$Thickness, pca_df$Stress)
+```
+
+
+```{r}
+pca_df <- pca_df %>%
+  dplyr::select(-"Force")
+```
+
+
+
+### PCA
+```{r}
+## GGPLOT PCA
+my.data2 <- pca_df %>%
+  # PCA variables, selected by name (positional indices drifted as columns were
+  # reshaped and were picking up the non-numeric Ident/Ident_rep columns).
+  dplyr::select(pH, FBM, GBM, Area_m2, Thickness, Volume, Density, Stress, Strain, YM)
+row.names(my.data2) <- pca_df$Ident_rep
+#colour = my.df[,12]
+pca <- prcomp(my.data2, scale = T, center = T)
+summary(pca)
+
+group <- pca_df[,2]
+group2 <- pca_df[,3]
+group3 <- pca_df[,4]
+
+
+
+scores <- as.data.frame(pca$x)                 # sample coordinates
+loadings <- as.data.frame(pca$rotation)        # variable loadings
+vars_to_show <- c("GBM", "Stress", "Density")
+loadings_sel <- loadings %>%
+  filter(row.names(loadings) %in% vars_to_show)
+mult <- min(
+  (max(scores$PC1) - min(scores$PC1)) /
+    (max(loadings_sel$PC1) - min(loadings_sel$PC1)),
+  (max(scores$PC2) - min(scores$PC2)) /
+    (max(loadings_sel$PC2) - min(loadings_sel$PC2))
+)
+
+loadings_sel_scaled <- loadings_sel * mult * 0.3
+loadings_sel_scaled$varname <- rownames(loadings_sel)
+arrow_names <- c("Biomass", "Density", "Ultimate \n strength")
+```
+
+
+### PCA plot
+```{r}
+graph_pca <- ggplot() +
+  # sample points
+  geom_point(data = scores,
+             aes(x = PC1, y = PC2, colour = group),
+             size = 2, alpha = 0.8) +
+  
+  # selected loading arrows
+  geom_segment(data = loadings_sel_scaled,
+               aes(x = 0, y = 0, xend = PC1, yend = PC2),
+               arrow = arrow(length = unit(0.25, "cm")),
+               colour = "black", linewidth = 0.5) +
+  
+  # variable labels
+  geom_text(data = loadings_sel_scaled,
+                aes(x = PC1 * c(1, 1.2, 1),
+                    y = PC2 * c(0.6, 1, 1.3),
+                    label = arrow_names),
+                    size = 3) +
+#geom_text(data = loadings_sel_scaled,
+            #aes(x = PC1 * c(0.5, 1, 1.2), y = PC2 * c(1.35, 1.6, 0.65), label = arrow_names),
+#            aes(x = PC1 * c(1.7, 0.16, -0.86), y = PC2 * c(-1.3, -1.57, -1.15), label = arrow_names),
+#            colour = "black", size = 3) +
+  
+  labs(
+    x = paste0("PC1 (", round(100 * summary(pca)$importance[2,1], 1), "%)"),
+    y = paste0("PC2 (", round(100 * summary(pca)$importance[2,2], 1), "%)")
+  ) + 
+  scale_colour_manual(name = "Condition", values = my_palette, labels = conditions) +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+graph_pca
+ggsave(paste0(path.figures, "S2. Exp2_PCA.svg"), graph_pca, width=10, height=6, units="cm", scale=1.3)
+
+```
+
+
+### PCA stats
+```{r}
+data_scaled <- scale(my.data2)
+dist_matrix <- dist(data_scaled, method = "euclidean")
+permanova_res <- adonis2(dist_matrix ~ group, permutations = 999)
+permanova_res
+bd <- betadisper(dist_matrix, group)
+anova(bd)
+plot(bd)
+```
+
+Permanova post hoc
+```{r}
+pairwise_permanova <- function(data_scaled, group, p.adjust.method = "holm") {
+  group_levels <- levels(group)
+  combs <- combn(group_levels, 2)
+  
+  results <- data.frame()
+  
+  for(i in 1:ncol(combs)) {
+    g1 <- combs[1, i]
+    g2 <- combs[2, i]
+    
+    idx <- group %in% c(g1, g2)
+    
+    sub_data <- data_scaled[idx, ]
+    sub_group <- droplevels(group[idx])
+    
+    sub_dist <- dist(sub_data)
+    
+    perm <- adonis2(sub_dist ~ sub_group, permutations = 999)
+    
+    results <- rbind(results,
+                     data.frame(
+                       Comparison = paste(g1, "vs", g2),
+                       p.value = perm$`Pr(>F)`[1]
+                     ))
+  }
+  
+  results$p.adj <- p.adjust(results$p.value, method = p.adjust.method)
+  
+  return(results)
+}
+
+pairwise_results <- pairwise_permanova(data_scaled, group)
+pairwise_results
+
+```
+
+```{r}
+# Stats
+# Euclidean distance on PCA scores
+scores$group <- group   # factor defining groups
+dist_matrix <- dist(scores[, c("PC1", "PC2")])
+
+adonis2(dist_matrix ~ group, data = scores, permutations = 999)
+
+
+# Suppose you have PCA scores
+dist_matrix <- dist(scores[, c("PC1", "PC2")])  # Euclidean distances
+
+# Groups
+groups <- scores$group
+
+# Pairwise PERMANOVA
+pairwise_permanova <- function(dist_matrix, groups, p.adjust.method = "holm") {
+  group_levels <- unique(groups)
+  res <- list()
+  
+  combs <- combn(group_levels, 2)
+  
+  for(i in 1:ncol(combs)) {
+    g1 <- combs[1, i]
+    g2 <- combs[2, i]
+    sub_idx <- which(groups %in% c(g1, g2))
+    sub_dist <- as.dist(as.matrix(dist_matrix)[sub_idx, sub_idx])
+    sub_group <- groups[sub_idx]
+    
+    perm <- adonis2(sub_dist ~ sub_group, permutations = 999)
+    res[[paste(g1, "vs", g2)]] <- perm$`Pr(>F)`[1]
+  }
+  
+  # Adjust p-values
+  pvals <- unlist(res)
+  p.adj <- p.adjust(pvals, method = p.adjust.method)
+  
+  data.frame(
+    Comparison = names(res),
+    p.value = pvals,
+    p.adj = p.adj
+  )
+}
+
+pairwise_permanova(dist_matrix, groups)
+
+```
+
+# Family chart
+Axis preparation
+```{r}
+x_labeled_breaks <- c(10, 100, 1000, 10000)
+y_labeled_breaks <- c(-0.0001, 0.001, 0.01, 0.1, 1, 10, 100, 1000)
+```
+
+Blank
+```{r}
+material_family_blank <- ggplot() +
+  labs(#title = "Material family from different spawn types",
+    x = expression("Density [kg/m"^3*"]"), 
+    y = "Young's modulus [MPa]") +
+  scale_x_log10(limits = c(10, 50000),
+                breaks = c(seq(10, 90, by = 10),
+                           seq(100, 900, by = 100),
+                           seq(1000, 9000, by = 1000),
+                           seq(10000, 50000, by = 10000)),
+                labels = function(b) ifelse(b %in% x_labeled_breaks, format(b, scientific = FALSE), "")) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) +
+  geom_vline(xintercept = x_labeled_breaks, color = "grey90", linetype = "solid") +
+  scale_y_log10(limits = c(0.0001, 3000),
+                breaks = c(seq(0.0001, 0.0009, by = 0.0001),
+                           seq(0.001, 0.009, by = 0.001),
+                           seq(0.01, 0.09, by = 0.01),
+                           seq(0.1, 0.9, by = 0.1),
+                           seq(1, 9, by = 1),
+                           seq(10, 90, by = 10),
+                           seq(100, 900, by = 100),
+                           seq(1000, 3000, by = 1000)),
+                labels = function(b) ifelse(b %in% y_labeled_breaks, format(b, scientific = T), "")) +
+  geom_hline(yintercept = y_labeled_breaks, color = "grey90", linetype = "solid")
+material_family_blank
+#ggsave(paste0(path.figures, "Exp2_Material family blank.svg"), material_family_blank, width=15, height=12, units="cm", scale=0.7)
+
+```
+
+To fill
+```{r}
+material_family_tofill <- ggplot() +
+  theme(axis.text = element_text(color = "white"),
+        axis.title = element_text(color = "white")) +
+  labs(#title = "Material family from different spawn types",
+    x = expression("Density [kg/m"^3*"]"), 
+    y = "Young's modulus [MPa]") +
+  scale_x_log10(limits = c(10, 50000),
+                breaks = c(seq(10, 90, by = 10),
+                           seq(100, 900, by = 100),
+                           seq(1000, 9000, by = 1000),
+                           seq(10000, 50000, by = 10000)),
+                labels = function(b) ifelse(b %in% x_labeled_breaks, format(b, scientific = FALSE), "")) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) +
+  scale_y_log10(limits = c(0.0001, 3000),
+                breaks = c(seq(0.0001, 0.0009, by = 0.0001),
+                           seq(0.001, 0.009, by = 0.001),
+                           seq(0.01, 0.09, by = 0.01),
+                           seq(0.1, 0.9, by = 0.1),
+                           seq(1, 9, by = 1),
+                           seq(10, 90, by = 10),
+                           seq(100, 900, by = 100),
+                           seq(1000, 3000, by = 1000)),
+                labels = function(b) ifelse(b %in% y_labeled_breaks, format(b, scientific = T), ""))
+material_family_tofill
+
+```
+
+The material-family plot is drawn further down, right after `fam.df` is built.
+
+
+# Material family dataframe
+`fam.df` holds one row per biological replicate and is the data behind the S3
+material-family figure. It is assembled from dataframes already built upstream,
+so no raw input is re-read here:
+```{r}
+# Sources (all keyed by Ident = one biological replicate):
+#   res.df               dry biomass GBM (the sample weight) + Levels
+#   youngs.df            Young's modulus per specimen -> mean per replicate
+#   purged_thickness_df  thickness per specimen       -> mean per replicate
+#   area.df              surface area from the ImageJ CSVs (already per replicate)
+fam.df <- res.df %>%
+  dplyr::select(Ident, Levels, GBM) %>%
+  left_join(youngs.df %>% group_by(Ident) %>% summarise(YM = mean(YM), .groups = "drop"),
+            by = "Ident") %>%
+  left_join(purged_thickness_df %>% group_by(Ident) %>% summarise(Thickness = mean(Thickness), .groups = "drop"),
+            by = "Ident") %>%
+  left_join(dplyr::select(area.df, Ident, Area_m2), by = "Ident") %>%
+  mutate(Volume  = Area_m2 * Thickness / 10^3,   # thickness mm -> m
+         Density = GBM / 10^3 / Volume)          # kg / m^3
+head(fam.df)
+#write.table(fam.df, file = paste0(path.tables, "Exp2_Biorep.csv"), dec = '.', sep=",", row.names = F)
+```
+
+## S3. Material family (Young's modulus vs density)
+Drawn here, after `fam.df` is built from the in-session tables.
+```{r}
+p <- material_family_tofill +
+  scale_color_manual(name = "Inoculation method", values = my_palette, labels = conditions) +
+  stat_summary(data = fam.df, fun = median, geom = "point", aes(x = Density, y = YM, colour = Levels))
+#stat_summary(data = fam.df, fun.data = mean_se, geom = "errorbar", aes(x = Density, y = estimate, colour = Levels))
+p
+ggsave(paste0(path.figures, "S4. Exp2_Material family.svg"), p, width=20, height=12.42, units="cm", scale=1)
+```
+

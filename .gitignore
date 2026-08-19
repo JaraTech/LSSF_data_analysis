@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+# Editor/temp
+*.tmp
+*~
+
+_to_delete/
+.DS_Store

@@ -1,0 +1,149 @@
+// Script_imageJ_Exp2.txt
+//
+// ImageJ / Fiji macro for the Experiment 2 (BP) image set.
+//
+// KEY DIFFERENCE FROM EXPERIMENT 1: each photograph here contains THREE
+// specimens side by side ("grouped three by three"), so one image yields three
+// measurements. Analyze Particles detects all three discs per photo and each
+// becomes its own ROI, i.e. its own row in that image's result CSV.
+//
+// What it does: walks an input folder of photographs, and for each image it
+//   1. makes a standardised greyscale copy (see NOTE below on how it is used),
+//   2. thresholds the image and detects the specimen objects as ROIs,
+//   3. shrinks each ROI inward by 10 px to avoid measuring edge pixels,
+//   4. measures shape and intensity statistics for each specimen,
+//   5. saves an annotated JPG (yellow outline per specimen) plus a per-image
+//      CSV of the measurements.
+//
+// How to run: open ImageJ/Fiji, drag this file onto the toolbar (or use
+//   Plugins > Macros > Run...). It asks for an INPUT folder (raw images) and an
+//   OUTPUT folder; point them at data/raw/images and data/processed. No paths
+//   are hardcoded, so it runs the same on any machine.
+//
+// Requires: ImageJ 1.52+ or Fiji. No extra plugins.
+//
+// Tunable parameters are flagged with "TUNE:" below. The object-detection
+// values (threshold, size, circularity) differ from Experiment 1 because the
+// specimens, scale and lighting differ.
+//
+// NOTE: the window handling in processFile() is harder to follow than the
+// Experiment 1 macro - there are two Duplicate/Close pairs, and the final
+// measurement is taken on the original image rather than on the standardised
+// copy (which is created and then closed). It reproduces the grey values in
+// data/processed/grey_values, but if you revisit this analysis it is worth
+// confirming which image each measurement is taken from.
+
+// TUNE: only files ending in this suffix are processed. The repo's raw images
+// are .jpeg (data/raw/images/*.jpeg); change this if you point the macro at a
+// folder of .png / .tif pictures instead.
+suffix = ".jpeg";
+
+// Ask the user where the raw images live and where results should be written.
+// getDirectory() opens a native folder-picker dialog; the text is just the
+// dialog title, so anyone can point the macro at their own folders.
+input  = getDirectory("Select the INPUT folder (raw images to process)");
+output = getDirectory("Select the OUTPUT folder (annotated images + result CSVs)");
+
+processFolder(input);
+
+// Recurse through the input folder (and any subfolders) and hand every file
+// with the target suffix to processFile(). Files are sorted so runs are
+// reproducible and the output order is predictable.
+function processFolder(input) {
+	list = getFileList(input);
+	list = Array.sort(list);
+	for (i = 0; i < list.length; i++) {
+		if(File.isDirectory(input + File.separator + list[i]))
+			processFolder(input + File.separator + list[i]);
+		if(endsWith(list[i], suffix))
+			processFile(input, output, list[i]);
+	}
+}
+
+// Process one image: standardise it, detect the three specimens, shrink and
+// measure them, and save an annotated picture plus a CSV of the measurements.
+function processFile(input, output, file) {
+	// Progress line so you can see which image is being handled and spot the
+	// one that failed if a run stops partway through.
+	print("Processing: " + input + File.separator + file);
+	open(input + File.separator + file);
+	imageName=getTitle;
+
+		// Start from a clean ROI Manager so ROIs from the previous image
+		// can't leak into this one's measurements.
+		if (isOpen("ROI Manager")) {
+    		selectWindow("ROI Manager");
+     		run("Close");
+ 		}
+
+		// --- Standardisation copy ---------------------------------------
+		// Duplicate the image and put it on a comparable brightness scale
+		// (8-bit greyscale + colour balance + contrast stretch).
+		run("Duplicate...", "TempImage");
+		run("8-bit");
+		run("Color Balance...");
+		run("Enhance Contrast", "saturated=0.35");
+		run("Close");                 // closes this standardisation copy (it is not reused below)
+
+		// --- Object detection -------------------------------------------
+		// Duplicate again, threshold to separate specimen from background,
+		// then detect the discs as ROIs.
+		run("Duplicate...", "TempImage-2");
+		// TUNE: raw grey range that counts as "specimen".
+		setThreshold(60, 165, "raw");
+		run("Close");                 // NOTE: closes the thresholded copy; Convert to Mask + Analyze
+		                              // Particles below then act on the original image - verify intended
+		run("Convert to Mask");
+		// TUNE: size (px^2) and circularity pick out the three specimen discs
+		// and reject debris. "add" stores each survivor as an ROI.
+		run("Analyze Particles...", "size=400000-2400000 circularity=0.00-0.80 add");
+
+		// Number of specimens found in this image (expected: 3).
+		n = roiManager("count");
+		print(n);
+
+		// Shrink each ROI inward by 10 px so edge pixels don't bias the
+		// intensity stats. (This step is enabled here; it is left disabled in
+		// the Experiment 1 macro.)
+for (i=0; i<n; i++) {
+          roiManager("select", i);
+          run("Enlarge...", "enlarge=-10");
+          roiManager("update");
+      	}
+
+		// --- Measure ----------------------------------------------------
+		// Measure the ROIs on the original image (imageName). Unlike the
+		// Experiment 1 macro, the standardised copy above is not used here.
+		selectWindow(imageName);
+		roiManager("Select", Array.getSequence(n));
+		run("Set Measurements...", "area mean standard modal centroid median skewness kurtosis redirect=None decimal=3");
+		run("Clear Results");
+		roiManager("Measure");
+
+		// --- Annotate ---------------------------------------------------
+		// Draw the ROIs back onto the original image as a thick yellow outline,
+		// flatten so the outline is baked into the pixels, then scale the
+		// preview down so it is quick to open and share.
+		selectWindow(imageName);
+			roiManager("Select",Array.getSequence(n));
+			roiManager("Set Color", "yellow");
+			roiManager("Set Line Width", 10);
+			roiManager("Update");
+			run("Flatten");
+			// TUNE: preview scale factor (0.05 = 5%). The width/height tokens are
+			// leftover size hints; ImageJ uses the x/y scale factors.
+			run("Scale...", "x=0.05 y=0.05 width=510000 height=702000 interpolation=Bilinear average create");
+
+		// Save the annotated preview and a CSV named after the source image, so
+		// each result file is traceable to the picture it came from.
+		saveAs("jpg", output + File.separator + file);
+
+		selectWindow("Results");
+			saveAs("Results", output + File.separator + "Results" + file + ".csv");
+
+			run("Clear Results");
+		close();
+		// Close every window before the next image so memory doesn't build up
+		// across a large batch.
+		run("Close All");
+}
