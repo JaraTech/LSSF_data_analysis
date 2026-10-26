@@ -1,8 +1,28 @@
-# macOS
-.DS_Store
-# Editor/temp
-*.tmp
-*~
+# =====================================================================
+# LSSF analysis repository — files kept OUT of the public GitHub repo
+# =====================================================================
 
-_to_delete/
+# --- Scratch / working / discarded folders -------------------------
+/_to_delete/
+/_previews/
+/Claude outputs/
+
+# --- Manuscript drafts & versions ----------------------------------
+/Manuscript versions/
+*.docx
+
+# --- Experiment scaffold (not part of the reproducible analysis) ---
+/experiments/_TEMPLATE/
+
+# --- Raw photographic image sets (archived on Zenodo, not GitHub) --
+/experiments/Experiment_1/data/raw/Backlit images/
+/experiments/Experiment_1/data/raw/Other images/
+
+# --- OS / editor / R session cruft ---------------------------------
 .DS_Store
+**/.DS_Store
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*~

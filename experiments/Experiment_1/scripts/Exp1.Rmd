@@ -38,7 +38,7 @@ input/output path relative to the repository.
 # 1. Dependencies
 # Clear the workspace so a rerun starts from a known-empty state - no stale
 # object from a previous run can silently feed into the results below.
-rm(list = ls())
+#rm(list = ls())
 # All packages and the shared plotting theme are defined once in
 # shared/dependencies.R and sourced from there, so a clean clone reproduces
 # without editing this notebook. The script installs any missing packages,
@@ -175,26 +175,42 @@ readings and regressing OD on concentration gives the slope used to convert
 sample OD into glucose concentration.
 
 ```{r}
-cc_conc <- c(2, 1, 0.8, 0.6, 0.4, 0.2, 0)
-my_df_cc <- as.data.frame(my_plate1A[,1:3])
-dil_curve <- 10
-my_cc <- my_df_cc %>%
-  mutate(conc = cc_conc,
-         mean = rowMeans(across(c(`1`, `2`, `3`))),
-         new_conc = conc/dil_curve)
+## Calibration curve (DNS, glucose standards)
+mw_ratio  <- 180.16 / 198.17                            # anhydrous / monohydrate = 0.909
+# The standard powder was dried at 60 °C before weighing, so the standards are
+# treated as anhydrous glucose. If FALSE, they are converted from monohydrate.
+standards_anhydrous <- TRUE
+cc_conc   <- c(2, 1, 0.8, 0.6, 0.4, 0.2, 0)              # standards as anhydrous glucose (g/L)
+if (!standards_anhydrous) cc_conc <- cc_conc * mw_ratio
+s0        <- 20 * mw_ratio                              # 18.18 g/L initial glucose
+dil_curve <- 10                                         # in-well dilution of the standards
 
-# "+ 0" forces the fit through the origin (zero glucose -> zero signal)
-model <- lm(mean ~ new_conc + 0, data = my_cc[1:8,])
-r2 <- summary(model)$r.squared
-coefs <- coef(model)
+my_cc <- as.data.frame(my_plate1A[, 1:3]) %>%
+  mutate(conc     = cc_conc,
+         mean     = rowMeans(across(c(`1`, `2`, `3`))),
+         new_conc = conc / dil_curve)                   # in-well concentration (g/L)
 
-eq_label <- sprintf("y = %.4fx + 0, R2 = %.4f", coefs[1], summary(model)$r.squared)
+# DNS response is linear only from 0.4 g/L upwards (0.2 g/L reads as the blank),
+# so the curve is fitted on the 0.4-2 g/L standards (rows 1-5), with intercept
+cal   <- my_cc[1:5, ]
+model <- lm(mean ~ new_conc, data = cal)
+cal_a <- unname(coef(model)[1])                         # intercept (OD)
+cal_b <- unname(coef(model)[2])                         # slope (OD per g/L in well)
+r2    <- summary(model)$r.squared
+loq_well <- min(cal$new_conc)                           # detection limit: lowest calibrated in-well concentration
 
-## Calibration curve A plot
-cc_plot <- ggplot(data = my_cc[1:5, ], aes(x = new_conc, y = mean)) +
-  geom_point() +
-  geom_smooth(method = "lm", se = FALSE) +
-  annotate("text", x = Inf, y = Inf, label = eq_label, hjust = 3.2, vjust = 2)
+# OD -> sample concentration: invert the calibration, then apply the well dilution
+od_to_conc <- function(od, dil) pmax((od - cal_a) / cal_b, 0) * dil
+
+eq_label <- sprintf("y = %.4fx + %.4f, R2 = %.4f", cal_b, cal_a, r2)
+
+## Calibration curve plot (open points = standards outside the linear range)
+cc_plot <- ggplot(my_cc, aes(x = new_conc, y = mean)) +
+  geom_point(data = my_cc[-(1:5), ], shape = 1) +
+  geom_point(data = cal) +
+  geom_smooth(data = cal, method = "lm", se = FALSE) +
+  annotate("text", x = Inf, y = -Inf, label = eq_label, hjust = 1.05, vjust = -1) +
+  labs(x = "Glucose in well (g/L)", y = "OD540")
 cc_plot
 ```
 
@@ -225,13 +241,17 @@ my_dil <- my_dilution1A[,4:12] %>%
   mutate(Sample = paste0(row, "_", Column)) %>%
   as.data.frame()
 
-# merge the three blocks on the well key; Conc = OD x slope / in-curve dilution x well dilution; column 4 is a blank
+# merge the three blocks on the well key; Conc = od_to_conc() (inverted calibration x well dilution)
 my_df1A <- Reduce(function(x, y) merge(x, y, by = c("row", "Column", "Sample")),
                   list(my_val, my_des, my_dil)) %>%
   filter(if_all(everything(), ~ !is.na(.))) %>%
   mutate(Plate = 1, Run = "A",
          value_dil = as.numeric(value_dil)) %>%
-  mutate(Conc = (value_num * coefs[1])/dil_curve*value_dil) %>%
+  mutate(Conc = od_to_conc(value_num, value_dil),
+         below_loq = (value_num - cal_a) / cal_b < loq_well) %>%
+  # Column 4 (t14v1-t14v7, technical replicate 1 of day 14) is excluded: rows v1-v4
+  # read at or below the 0 g/L standard and rows v5-v7 about half of replicates 2-3,
+  # consistent with a well-loading error. Day-14 means are therefore n = 2.
   filter(!Column == 4)
 
 
@@ -254,13 +274,19 @@ my_dil <- my_dilution2A %>%
   mutate(Sample = paste0(row, "_", Column)) %>%
   as.data.frame()
 
-# merge the three blocks on the well key; Conc = OD x slope / in-curve dilution x well dilution; column 4 is a blank
+# merge the three blocks on the well key; Conc = od_to_conc() (inverted calibration x well dilution)
 my_df2A <- Reduce(function(x, y) merge(x, y, by = c("row", "Column", "Sample")),
                  list(my_val, my_des, my_dil)) %>%
   filter(if_all(everything(), ~ !is.na(.))) %>%
   mutate(Plate = 2, Run = "A",
          value_dil = as.numeric(value_dil)) %>%
-  mutate(Conc = (value_num * coefs[1])/dil_curve*value_dil)
+  mutate(Conc = od_to_conc(value_num, value_dil),
+         below_loq = (value_num - cal_a) / cal_b < loq_well)
+
+# Detection limit in sample units (lowest standard in the well x sample dilution)
+# = 0.8 g/L. Depleted cultures read 0.6-0.75 g/L, which is what the 0 g/L standard
+# converts to (blank-level OD), so they are reported as below the detection limit.
+loq_sample <- loq_well * unique(my_df2A$value_dil)
 ```
 
 Merge databases
@@ -287,7 +313,10 @@ my_dfA <- bind_rows(my_df1A, my_df2A) %>%
          Sample_Tech = as.factor(paste0(Sample, ".", Techrep))) %>%
   #arrange(Sample_Tech, desc(Run == "A")) %>%
   #distinct(Sample_Tech, .keep_all = TRUE) %>%
-  dplyr::select(Sample, Sample_Tech, Techrep, Time, Volume, value_num, Conc)
+  dplyr::select(Sample, Sample_Tech, Techrep, Time, Volume, value_num, Conc, below_loq)
+
+# no reducing-sugar value may exceed the initial glucose concentration
+stopifnot(all(my_dfA$Conc <= s0))
 ```
 
 Stats for glucose consumption (n = 3)
@@ -300,9 +329,10 @@ so this file is an output rather than a dependency.
 ```{r}
 df_rsm_stats <- my_dfA %>%
   group_by(Sample, Time, Volume) %>%
-  summarise(meanC = mean(Conc), sdC = sd(Conc)) %>%
+  summarise(meanC = mean(Conc), sdC = sd(Conc),
+            below_loq = meanC < loq_sample) %>%
   as.data.frame() %>%
-  dplyr::select(Volume, Time, meanC) %>%
+  dplyr::select(Volume, Time, meanC, below_loq) %>%
   arrange(Volume, Time)
 #write.table(df_rsm_stats, file = file.path(path.tables, "Exp1 - Glu.csv"), dec = '.', sep=",", row.names = F)
 
@@ -312,7 +342,7 @@ df_rsm_stats <- my_dfA %>%
 
 ## Fresh biomass and GV
 
-Overlay dry biomass (points, at their true values) and lnGV (bars) for the 108 mL
+Overlay fresh biomass (points, at their true values) and lnGV (bars) for the 108 mL
 series on one dual-axis plot. Because grey value falls as biomass rises, lnGV is
 mapped into biomass space with a negative slope so the two line up; the secondary
 axis inverts that mapping.
@@ -350,14 +380,14 @@ FBM_lnGV <- ggplot(fbm_gv_df_108, aes(x = Time)) +
   # bars = lnGV mapped into FBM space, rising from the bottom
   geom_segment(aes(x = Time, xend = Time, y = y_bottom, yend = a + b * lnGV,
                    colour = lnGV),
-               linewidth = 10, lineend = "butt") +
+               linewidth = 6, lineend = "butt") +
   # points = FBM at their TRUE values on the primary axis
   geom_point(aes(y = FBM),
              shape = 21, size = 3, stroke = 0.6,
              fill = "#FFF7B2", colour = "black") +
   scale_y_continuous(
-    name     = "Dry biomass (g)",                                # FIRST axis  = FBM (left)
-    sec.axis = sec_axis(~ (. - a) / b, name = "Transmittance")   # SECOND axis = GV (right)
+    name     = "Fresh biomass (g)",                                # FIRST axis  = FBM (left)
+    sec.axis = sec_axis(~ (. - a) / b, name = "Light absorbance")   # SECOND axis = GV (right)
   ) +
   scale_x_continuous(
     name     = "Time (days)"
@@ -377,7 +407,7 @@ FBM_lnGV <- ggplot(fbm_gv_df_108, aes(x = Time)) +
 
 FBM_lnGV
 
-#ggsave(file.path(path.figures,"1. Exp1_FBMtoTransmittance.svg"), FBM_lnGV, width=12, height=8, units="cm", scale=1.15)
+#ggsave(file.path(path.figures,"1. Exp1_FBMtoTransmittance.svg"), FBM_lnGV, width=12, height=8, units="cm", scale=0.8)
 ```
 
 ## PLOT fresh biomass
@@ -424,7 +454,7 @@ contour_panel <- function(df, value, fill_name, direction = 1, rescaler = scales
 matrix_FBM <- matrix(unlist(my_df$FBM), nrow = 7, ncol = 7, byrow = F)
 df_contour$FBM <- as.vector(matrix_FBM)
 
-graph_fresh_biomass <- contour_panel(df_contour, "FBM", "FBM (g)")
+graph_fresh_biomass <- contour_panel(df_contour, "FBM", "Biomass (g)")
 graph_fresh_biomass
 #ggsave(file.path(path.figures, "2. Exp1_FBM.svg"), graph_fresh_biomass, width=7.5, height=6, units="cm", scale=1.5)
 
@@ -452,7 +482,7 @@ gv_ramp <- function(x, to = c(0, 1), from = range(x, na.rm = TRUE)) {
   u <- (x - from[1]) / (from[2] - from[1])
   (1 - exp(-3 * u)) / (1 - exp(-3))
 }
-graph_GV <- contour_panel(df_contour, "lnGV", "Grey Value", direction = -1, rescaler = gv_ramp) +
+graph_GV <- contour_panel(df_contour, "lnGV", "Transmittance", direction = -1, rescaler = gv_ramp) +
   guides(fill = guide_colourbar(reverse = TRUE))   # invert the bar: yellow (low grey value) on top
 graph_GV
 #ggsave(file.path(path.figures, "3. Exp1_lnGV.svg"), graph_GV, width=7.5, height=6, units="cm", scale=1.5)
@@ -462,17 +492,17 @@ graph_GV
 
 ## MODEL FOR BIOMASS FORMATION
 
-The response-surface model: a full second-order (quadratic) regression of fresh
-biomass on Time and Volume with both squared terms and their interaction — this is
-what "RSM" refers to. The fitted surface is then used to locate the Time/Volume
-that maximises biomass.
+The response-surface model: a full second-order (quadratic) regression of estimated
+dry biomass (FBM × 0.0547) on Time and Volume with both squared terms and their
+interaction — this is what "RSM" refers to. The fitted surface is then used to locate
+the Time/Volume that maximises biomass.
 
 Model
 
 ```{r}
 Volume <- as.numeric(my_data$Volume)
 Time <- as.numeric(my_data$Time)
-Biomass <- my_data$FBM
+Biomass <- my_data$FBM * 0.0547
 
 # model
 my_model <- lm(Biomass ~ Time + Volume + I(Time^2) + I(Volume^2) + Volume:Time)
@@ -522,7 +552,7 @@ grid <- expand.grid(Time = Time_g, Volume = Vol_g)
 # make matrix
 grid$yhat <- predict(my_model, newdata = data.frame(Volume = grid$Volume,
                                                     Time   = grid$Time))
-grid$yhat <- ifelse(grid$yhat > 0.15, grid$yhat, 0)
+grid$yhat <- pmax(grid$yhat, 0)   # floor only unphysical negative predictions; the old hardcoded 0.15 floor clipped real values on the dry-biomass (FBM*0.0547) scale and flattened the corners to 0
 z <- matrix(grid$yhat, nrow = resolution)
 # diagnostic print (unassigned): grid rows lying near the stationary Time
 grid[grid$Time > stationary[1] - 0.2 & grid$Time < stationary[1] + 0.2, ]
@@ -535,18 +565,58 @@ Interactive 3-D surface of predicted biomass over the Time × Volume space.
 
 ```{r}
 # Plot biomass
-fig <- plot_ly(x = Time_g, y = Vol_g, z = z, type = "surface",
+bm_step <- 0.05   # spacing of the biomass contour lines on the floor (in g). 0.05 -> ~8 lines over the 0.07-0.46 range; 0.1 -> ~4; 0.2 -> 2
+fig_model <- plot_ly(x = Time_g, y = Vol_g, z = z, type = "surface",
                # 49 discrete colours = one per sample in the 7x7 design
                color = z, colors = viridis_pal(option = "B")(49)) %>%
   layout(scene = list(xaxis = list(title = "Time"),
                       yaxis = list(title = "Volume"),
                       zaxis = list(title = "Biomass"))) %>%
-  add_surface(contours = list(z = list(show=TRUE, usecolormap=TRUE, project=list(z=TRUE))), showscale = T) %>%
-  # TODO: "My Plot Title" is a placeholder - set the figure's real title or drop it
-  layout(title = list(text = "My Plot Title",
-                    font = list(size = 22)))
-fig
+  add_surface(contours = list(z = list(show = TRUE, usecolormap = TRUE, project = list(z = TRUE),
+                                       start = 0, end = max(z), size = bm_step)), showscale = T) %>%
+  layout(font  = list(family = "Arial", size = 12),
+         scene = list(xaxis = list(title = "Time"),
+                      yaxis = list(title = "Volume"),
+                      zaxis = list(title = "Biomass"),
+                      # Fix the viewing angle so the export is reproducible
+                      camera = list(eye = list(x = -0.8, y = -2, z = 0.9))))
+fig_model
 ```
+
+```{r}
+## Mock figure for graphical abstract
+
+# Shared axis style for the graphical abstract: axis line and title only
+ga_axis <- function(title) {
+  list(title          = title,
+       showline       = TRUE,     # keeps the axis line
+       linecolor      = "lightgrey",
+       linewidth      = 2,
+       showbackground = FALSE,    # removes the coloured walls and floor
+       showgrid       = FALSE,    # removes the grid lines
+       zeroline       = FALSE,
+       showticklabels = FALSE,    # removes the axis numbers
+       ticks          = "",       # removes the tick marks
+       showspikes     = FALSE)    # no projection lines on hover
+}
+
+mock_fig_model_GA <- plot_ly(x = Time_g, y = Vol_g, z = z,
+                             # 49 discrete colours = one per sample in the 7x7 design
+                             color = z, colors = viridis_pal(option = "B")(49)) %>%
+  add_surface(contours = list(z = list(show = TRUE, usecolormap = TRUE,
+                                       project = list(z = FALSE),  # no contours on the floor
+                                       start = 0, end = max(z), size = bm_step)),
+              showscale = TRUE) %>%
+  layout(font  = list(family = "Arial", size = 12),
+         scene = list(xaxis  = ga_axis("Time"),
+                      yaxis  = ga_axis("Volume"),
+                      zaxis  = ga_axis("Biomass"),
+                      # Fixed viewing angle so the export is reproducible
+                      camera = list(eye = list(x = -0.8, y = -2, z = 0.9))))
+mock_fig_model_GA
+
+```
+
 
 Resolve equation for biomass
 
@@ -557,6 +627,21 @@ model coefficients.
 # Predicted biomass at the experimental points. Use predict() so this reproduces
 # the fitted model exactly (including the linear Volume term).
 Biomass_hat <- predict(my_model)
+
+# --- Biomass-accumulation equation, kept in its own objects ---
+# my_model is reassigned to the glucose model further down, so copy the fitted
+# biomass surface here to keep it (and its equation) available for later reference.
+biomass_model <- my_model
+biomass_coefs <- coef(biomass_model)
+biomass_r2    <- summary(biomass_model)$r.squared
+
+# Human-readable equation string (terms in the model's order).
+biomass_eq <- sprintf(
+  "Biomass = %.4g %+.4g*Time %+.4g*Volume %+.4g*Time^2 %+.4g*Volume^2 %+.4g*Time:Volume  (R^2 = %.3f)",
+  biomass_coefs[["(Intercept)"]], biomass_coefs[["Time"]], biomass_coefs[["Volume"]],
+  biomass_coefs[["I(Time^2)"]], biomass_coefs[["I(Volume^2)"]], biomass_coefs[["Time:Volume"]],
+  biomass_r2)
+biomass_eq
 ```
 
 ## PLOT glucose
@@ -568,7 +653,7 @@ with `my_dfA` only to set up the axes.
 
 ```{r plot-glucose, echo=FALSE}
 # one line type per volume
-linetypes_ordered <- c("solid", "dotted", "dotdash", "longdash", "twodash", "dashed", "solid")
+linetypes_ordered <- c("solid", "dotted", "dotdash", "longdash", "twodash", "dashed", "1F")
 
 my_plotA_inferno <- ggplot(my_dfA, aes(x = as.numeric(Time), y = Conc)) +
   labs(y = "Reducing sugars (g/L)", x = "Incubation time (days)") +
@@ -581,7 +666,7 @@ my_plotA_inferno <- ggplot(my_dfA, aes(x = as.numeric(Time), y = Conc)) +
     shape = 16, size = 3) +
   scale_colour_viridis_c(option = "inferno", direction = -1, name = "Conc") +
   scale_linetype_manual(values = linetypes_ordered, breaks = volumes, name = "Volume") +
-  ylim(0, 9) #+
+  ylim(0, NA) #+
   #theme(legend.position = "bottom")
 
 my_plotA_inferno
@@ -590,8 +675,8 @@ my_plotA_inferno
 
 ## GLUCOSE MODEL
 
-Fit glucose against incubation time and volume using only the pre-peak samples
-(the same per-volume time cut-offs as the grey-value/biomass correlation). `Surface`
+Fit glucose against incubation time and volume over the active-consumption
+window: per volume, all time points up to and including the first mean below 1 g/L. `Surface`
 and `MGlucose` are per-volume constants attached for the alternative model
 formulations tried below.
 
@@ -602,25 +687,84 @@ Dataframe
 # Self-contained: join per-sample mean glucose (df_rsm_stats$meanC) onto the numeric
 # biomass table by Volume + Time, so this section is independent of the `glu` column
 # in the CORRELATIONS section below. Volume/Time stay numeric, so the
-# lm below fits continuous slopes (as the eq_label assumes), then keep the pre-peak
-# time points per volume (cut-offs below).
+# lm below fits continuous slopes (as the eq_label assumes), then keep the
+# active-consumption time points per volume (cut-offs below).
 my_glulm_df <- dplyr::left_join(my_data, dplyr::rename(df_rsm_stats, glu = meanC),
                                 by = c("Volume", "Time"))
+```
 
+```{r}
+## Fermentative parameters - Specific Yield per volume
+inoc_bio <- 5/18 # 5 mg in 18 mL of inoculum -> 0.278 mg/mL
+
+my_fermparam_df <- my_glulm_df %>%
+  rename(GBM = DBM) %>% # From DBM to glycerol biomass
+  mutate(eDBM = FBM * 0.0547, # according to lyophilized
+         Biomass_conc = (eDBM - inoc_bio*Volume/6/1000)*1000/Volume,  ## inoc_bio in mg, Volume/6 = inoc volume, /1000 to match g from eDBM
+         Productivity = Biomass_conc/(Time*24),
+         Consumption_rate = (s0-glu)/(Time*24),
+         Specific_yield = Biomass_conc/(s0-glu))
+
+my_data_plot <- my_fermparam_df[my_fermparam_df$Time == 7,]
+
+syieldplot <- ggplot(my_data_plot, aes(x = as.factor(Volume), y = Specific_yield, fill = Specific_yield)) +
+  geom_col(width = 0.6, colour = "black", linewidth = 0.3) +   # black outline, optional
+  scale_y_continuous(name   = "Specific yield (g/g)") +  # bars start on the x-axis
+  scale_x_discrete(name = "Volume (mL)") +
+  scale_fill_viridis_c(option = "inferno", name = "")
+syieldplot
+
+#ggsave(file.path(path.figures, "6. SpecificYield_volume.svg"), syieldplot, width=7.5, height=4, units="cm", scale=1.1)
+
+```
+
+```{r}
+## Surface concentration
+# path.raw was repointed to the ImageJ CSV folder above, so rebuild the raw path from base.
+per_volume_df <- read_excel(file.path(base, "data", "raw", "Exp1_fermentative_parameters.xlsx"),
+                            sheet = "Per volume", range = "A1:I8") %>%
+  rename(Surfconc = "SIA (cm-1)",
+         Volume = "Volume (mL)") %>%
+  as.data.frame()
+  
+surfconc_plot <- ggplot(per_volume_df, aes(x = as.factor(Volume), y = Surfconc, fill = Surfconc)) +
+  geom_col(width = 0.6, colour = "black", linewidth = 0.3) +   # black outline, optional
+  scale_y_continuous(name = expression(SIA~(cm^{-1}))) +
+  #scale_y_continuous(name   = "Surface to \nvolume ratio \n(cm2/cm3)") +  # bars start on the x-axis
+  scale_x_discrete(name = "Volume (mL)") +
+  scale_fill_viridis_c(option = "inferno", name = "")
+surfconc_plot
+
+#ggsave(file.path(path.figures, "7. SurfaceConc_volume.svg"), surfconc_plot, width=7.5, height=4, units="cm", scale=1.1)
+```
+
+
+```{r}
+#Select data for glucose consumption
 my_surfaces <- c(49.43, 49.85, 50.26, 50.67, 51.08, 51.49, 51.90)
 my_glucose <- c(0.59, 0.88, 1.06, 1.20, 1.30, 1.46, 1.36)
-my_lm_df <- my_glulm_df[my_glulm_df$Volume == volumes[1] & my_glulm_df$Time %in% times[1:2] |
-                        my_glulm_df$Volume == volumes[2] & my_glulm_df$Time %in% times[1:3] |
-                        my_glulm_df$Volume == volumes[3] & my_glulm_df$Time %in% times[1:5] |
-                        my_glulm_df$Volume == volumes[4] & my_glulm_df$Time %in% times[1:6] |
-                        my_glulm_df$Volume == volumes[5] & my_glulm_df$Time %in% times[1:7] |
-                        my_glulm_df$Volume == volumes[6] & my_glulm_df$Time %in% times[1:7] |
-                        my_glulm_df$Volume == volumes[7] & my_glulm_df$Time %in% times[1:7],] %>%
-  mutate(Surface = c(rep(my_surfaces[1], 2), rep(my_surfaces[2], 3), rep(my_surfaces[3], 5), rep(my_surfaces[4], 6), rep(my_surfaces[5], 7), rep(my_surfaces[6], 7), rep(my_surfaces[7], 7)),
-         MGlucose = c(rep(my_glucose[1], 2), rep(my_glucose[2], 3), rep(my_glucose[3], 5), rep(my_glucose[4], 6), rep(my_glucose[5], 7), rep(my_glucose[6], 7), rep(my_glucose[7], 7)))
+# per volume, keep every time point up to and including the first mean below
+# glu_cutoff (all points if it never drops below)
+glu_cutoff <- 1
+my_lm_df <- my_glulm_df %>%
+  arrange(Volume, Time) %>%
+  group_by(Volume) %>%
+  filter(cumsum(lag(glu < glu_cutoff, default = FALSE)) == 0) %>%
+  ungroup() %>%
+  mutate(Surface = my_surfaces[match(Volume, volumes)],
+         MGlucose = my_glucose[match(Volume, volumes)]) %>%
+  as.data.frame()
+my_lm_df %>% group_by(Volume) %>% summarise(last_time = max(Time), n = n())
                      
 
 ```
+
+
+
+
+
+
+
 Model — an additive Time + Volume fit (common slope) compared against a
 Time × Volume interaction; the additive model is kept as `my_model`.
 
@@ -636,6 +780,12 @@ summary(my_model)
 my_model1 <- lm(glu ~ Time * Volume, my_lm_df)
 summary(my_model1)
 anova(my_model, my_model1)
+
+# constant consumption per unit surface: glucose removed scales with Time * Surface / Volume
+my_model_surf <- lm(glu ~ Volume + I(Time * Surface / Volume), my_lm_df)
+summary(my_model_surf)
+AIC(my_model, my_model_surf)
+
 r2 <- summary(my_model)$adj.r.squared
 coefs <- coef(my_model)
 
@@ -647,8 +797,9 @@ Plot — fitted glucose lines from the additive model, over the measured points.
 
 ```{r}
 eq_label <- sprintf("y = %.4f + %.4ft + %.4fv, R2 = %.4f", coefs[1], coefs[2], coefs[3], r2)
+eq_label
 
-linetypes_ordered <- c("solid", "dotted", "dotdash", "longdash", "twodash", "dashed", "solid")
+linetypes_ordered <- c("solid", "dotted", "dotdash", "longdash", "twodash", "dashed", "1F")
 
 sugar_model_plot <- ggplot(my_dfA, aes(x = as.numeric(Time), y = Conc)) +
   labs(y = "Reducing sugars (g/L)", x = "Incubation time (days)") +
@@ -659,10 +810,35 @@ sugar_model_plot <- ggplot(my_dfA, aes(x = as.numeric(Time), y = Conc)) +
   scale_linetype_manual(values = linetypes_ordered, breaks = volumes, name = "Volume") +
   geom_point(data = df_rsm_stats, aes(x = as.numeric(Time), y = meanC, colour = meanC, shape = as.factor(Volume)), size = 3) +
   scale_shape_manual(values = c(7:12, 14), breaks = volumes, name = "Volume") +
-  ylim(0, 9)
+  ylim(0, NA)
   #annotate("text", x = Inf, y = Inf, label = eq_label, hjust = 1.1, vjust = 1.5)
 sugar_model_plot
-#ggsave(file.path(path.figures, "5. Exp1_glu_model.svg"), sugar_model_plot, width=8, height=7, units="cm", scale=1.5)
+#ggsave(file.path(path.figures, "5. Exp1_glu_model.svg"), sugar_model_plot, width=12.48, height=6, units="cm", scale=1.5)
+```
+
+
+```{r}
+## Mock figure for graphical abstract
+mock_my_dfA <- my_dfA[my_dfA$Volume %in% c(18, 126),]
+mock_my_lm_df <- my_lm_df[my_lm_df$Volume %in% c(36, 72, 108),]
+mock_df_rsm_stats <- df_rsm_stats[df_rsm_stats$Volume %in% c(18, 126),]
+
+mock_sugar_model_plot_GA <- ggplot(mock_my_dfA, aes(x = as.numeric(Time), y = Conc)) +
+  labs(y = "", x = "") +
+  geom_line(data = mock_my_lm_df, aes(x = Time, y = pred, group = as.factor(Volume), linetype = as.factor(Volume)),
+            linewidth = 1, inherit.aes = FALSE, colour = "lightgray") +
+  scale_colour_viridis_c(option = "inferno", direction = -1, name = "g/L") +
+  scale_linetype_manual(values = linetypes_ordered, breaks = volumes, name = "Volume") +
+  geom_point(data = mock_df_rsm_stats, aes(x = as.numeric(Time), y = meanC, colour = meanC), size = 5) +
+  ylim(0, NA) +
+  guides(fill = "none", colour = "none", linetype = "none") +
+  # Graphical abstract style: axis lines and titles only
+  theme_classic(base_family = "Arial", base_size = 12) +   # no frame, no grid, no grey panel
+  theme(axis.text  = element_blank(),                     # removes the axis numbers
+        axis.ticks = element_blank(),                     # removes the tick marks
+        axis.line  = element_line(colour = "lightgray", linewidth = 0.8))
+mock_sugar_model_plot_GA
+#ggsave(file.path(path.figures, "0. Exp1_glu_model_GA.svg"), mock_sugar_model_plot_GA, width=10, height=6, units="cm", scale=1)
 
 ```
 
@@ -698,6 +874,8 @@ Dataframe
 ```{r}
 my_data$GV <- my_gv_df$Mean
 df_rsm_stats
+# positional assignment: both tables must be in the same Volume x Time order
+stopifnot(all(my_data$Volume == df_rsm_stats$Volume), all(my_data$Time == df_rsm_stats$Time))
 my_data$glu <- df_rsm_stats$meanC
 my_df <- my_data %>%
   select(Volume, Time, pH, FBM, DBM, GV, glu)
@@ -711,39 +889,38 @@ Correlation between GV and fresh biomass
 
 ```{r}
 ## Correlation GV & biomass
-cor_GV_FBMlog <- cor.test(-log(my_df$GV), my_df$FBM)
-cor_GV_FBMlog
-
+cor_lnGV_FBM <- cor.test(fbm_gv_df$FBM, fbm_gv_df$lnGV)
+cor_lnGV_FBM
 # This analysis discarded the data points post biomass peak
-my_gvlm_df <- my_df[my_df$Volume == volumes[1] & my_df$Time %in% times[1:3] |
-                      my_df$Volume == volumes[2] & my_df$Time %in% times[1:3] |
-                      my_df$Volume == volumes[3] & my_df$Time %in% times[1:5] |
-                      my_df$Volume == volumes[4] & my_df$Time %in% times[1:6] |
-                      my_df$Volume == volumes[5] & my_df$Time %in% times[1:7] |
-                      my_df$Volume == volumes[6] & my_df$Time %in% times[1:6] |
-                      my_df$Volume == volumes[7] & my_df$Time %in% times[1:6],]
-cor_GV_FBMlog_ <- cor.test(my_gvlm_df$GV, my_gvlm_df$FBM)
-cor_GV_FBMlog_
+fbm_gv_df_truncated <- fbm_gv_df[fbm_gv_df$Volume == volumes[1] & fbm_gv_df$Time %in% times[1:3] |
+                      fbm_gv_df$Volume == volumes[2] & fbm_gv_df$Time %in% times[1:3] |
+                      fbm_gv_df$Volume == volumes[3] & fbm_gv_df$Time %in% times[1:5] |
+                      fbm_gv_df$Volume == volumes[4] & fbm_gv_df$Time %in% times[1:6] |
+                      fbm_gv_df$Volume == volumes[5] & fbm_gv_df$Time %in% times[1:7] |
+                      fbm_gv_df$Volume == volumes[6] & fbm_gv_df$Time %in% times[1:6] |
+                      fbm_gv_df$Volume == volumes[7] & fbm_gv_df$Time %in% times[1:6],]
+cor_lnGV_FBM_truncated <- cor.test(fbm_gv_df_truncated$FBM, fbm_gv_df_truncated$lnGV)
+cor_lnGV_FBM_truncated
 ```
 
 Fermentative parameters
 
-Standard bioprocess parameters per sample: dry biomass (FBM × 0.16), biomass
+Standard bioprocess parameters per sample: dry biomass (FBM × 0.0547), biomass
 concentration Cx (g/L), productivity Qx (per hour), substrate-uptake rate Qs (from
-glucose consumed against 20 g/L initial), and biomass yield on substrate Yxs.
+glucose consumed against s0 = 18.18 g/L initial), and biomass yield on substrate Yxs.
 
 ```{r}
 fp_df <- my_data %>%
   select(Volume, Time, pH, FBM, DBM, GV, glu) %>%
   rename(GBM = DBM,
          Glucose = glu) %>%
-  mutate(Biomass = FBM * 0.16,
+  mutate(Biomass = FBM * 0.0547,
          LnGV = log(GV),
          Cx = Biomass / (Volume / 1000),
          Qx = Cx / (Time * 24),
-         # 20 = initial glucose (g/L), so (20 - Glucose) is the amount consumed
-         Qs = (20 - Glucose) / (Time * 24),
-         Yxs = Cx / (20 - Glucose)) %>%
+         # s0 = initial glucose (18.18 g/L), so (s0 - Glucose) is the amount consumed
+         Qs = (s0 - Glucose) / (Time * 24),
+         Yxs = Cx / (s0 - Glucose)) %>%
   select(Volume, Time, pH, LnGV, Biomass, Glucose, Cx, Qx, Qs, Yxs)
 #write.table(fp_df, file = file.path(path.tables, "Exp1 - Master datatable.csv"), dec = '.', sep=",", row.names = F)
 ```
@@ -771,7 +948,7 @@ ggplot(height_df, aes(x = volumes, y = heights)) +
 
 From fresh to lyo
 
-Fit the fresh → dry (lyophilised) biomass relationship that underpins the 0.16
+Fit the fresh → dry (lyophilised) biomass relationship that underpins the 0.0547
 factor used in the fermentative parameters above, from the "3 - fresh to lyo"
 sheet of `Exp1_fbm2lyo.xlsx`. Note: this chunk OVERWRITES `my_data`, so run it
 last (or restart before rerunning the notebook from the top).
@@ -790,15 +967,19 @@ model <- lm(Lbio ~ Fbio + 0, data = my_data)
 r2 <- summary(model)$r.squared
 coefs <- coef(model)
 
-eq_label <- sprintf("DBM = %.4f FBM + 0, R2 = %.4f", coefs[1], summary(model)$r.squared)
+cor.test(my_data$Lbio, my_data$Fbio)
+
+eq_label <- sprintf("DBM = %.4f FBM + 0, \nR2 = %.4f", coefs[1], summary(model)$r.squared)
 
 FBMtoLyo <- ggplot(my_data, aes(Fbio, Lbio)) +
   geom_point(alpha = 0.6) +
   geom_smooth(method = "lm", se = F, colour = "black") +
-  annotate("text", x = Inf, y = Inf, label = eq_label, vjust = 4, hjust = 1.6) +
+  annotate("text", x = Inf, y = Inf, label = eq_label, vjust = 3.5, hjust = 1.4) +
   labs(y = "Lyophilized biomass (mg)",
-       x = "Fresh biomass (mg)")
-#ggsave(file.path(path.figures, "S. Exp1_FBMtoLyo.svg"), FBMtoLyo, width=8, height=6, units="cm", scale=1.5)
+       x = "Fresh biomass (mg)") +
+  theme(panel.border = element_blank(),                  # removes the box
+        axis.line    = element_line(colour = "black"))   # keeps the x and y axis lines
+#ggsave(file.path(path.figures, "S. Exp1_FBMtoLyo.svg"), FBMtoLyo, width=9, height=8, units="cm", scale=1.1)
 ```
 
 

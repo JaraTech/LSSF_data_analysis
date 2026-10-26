@@ -22,13 +22,15 @@
   "ggplot2",  # every 2D plot
   "viridis",  # viridis_pal() colour ramp
   "plotly",   # the interactive 3D biomass surface
+  "plot3D",   # static 3D biomass surface for the .svg/.png figure export
   "scales",   # scales::squish() in the transmittance plot
   # --- also used by Experiment 2 (BP) ---
   "car",         # leveneTest() / Anova() in the significance tests
   "multcompView",# multcompLetters() compact-letter displays
   "broom",       # tidy() the per-group lm fits
   "vegan",       # adonis2() / betadisper() PERMANOVA on the PCA scores
-  "svglite"      # ggsave() SVG device for the .svg figure exports
+  "svglite",     # ggsave() SVG device for the .svg figure exports
+  "ggpubr"       # stat_pvalue_manual() significance brackets (Exp2 ultimate-strength plot)
 )
 
 # Install any that are not already available, then attach all of them.

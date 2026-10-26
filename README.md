@@ -1,68 +1,51 @@
-# LSSF
+# LSSF — Data Analysis
 
-Raw data and analysis code for the LSSF study (submitted to *Microbial
-Biotechnology*).
-
-Each experiment is a self-contained module under `experiments/`. To reproduce
-one, open its folder and follow its README.
-
-## Experiments
-
-| ID           | Description                          | Folder |
-|--------------|--------------------------------------|--------|
-| Experiment_1 | RSM image analysis and statistics    | [experiments/Experiment_1](experiments/Experiment_1) |
-| Experiment_2 | (to be added)                        | [experiments/Experiment_2](experiments/Experiment_2) |
-
-*Add one row per experiment. To start a new one, copy `experiments/_TEMPLATE`.*
+Reproducible analysis for a study on **Liquid-Static Surface Fermentation (LSSF)**
+for the production of mycelium materials (submitted to *Microbial Biotechnology*).
+The repository contains the raw inputs and the R Markdown notebooks that generate
+every figure and table reported in the manuscript.
 
 ## Repository layout
 
-    experiments/
-      <ID>/
-        data/
-          raw/        primary data, measured once, NEVER regenerated
-          processed/  script-generated data, regenerable from raw/
-        scripts/      code (turns raw/ into processed/ and results/)
-        results/      final figures & tables for the paper
-        README.md     what the experiment is and how to run it
-    shared/           code or resources used by more than one experiment
-      dependencies.R  installs & loads the R packages the notebooks need
-    .here             marker so R's here() can resolve repo-relative paths
-
-The organising rule is provenance: everything outside `data/raw/` can be
-rebuilt from `data/raw/` plus `scripts/`, so only `data/raw/` is irreplaceable.
+```
+.here                     # anchor for here::here(); defines the project root
+shared/
+  dependencies.R          # single source of truth for packages + shared ggplot theme
+experiments/
+  Experiment_1/
+    data/raw/             # measured inputs (.xlsx spreadsheets, images)
+    scripts/Exp1.Rmd      # Experiment 1 notebook
+    results/figures/      # exported figures (.svg)
+    results/tables/       # exported tables (.csv/.xlsx)
+  Experiment_2/
+    data/raw/
+    scripts/Exp2.Rmd
+    results/figures/
+    results/tables/
+```
 
 ## Requirements
 
-- ImageJ 1.52+ or Fiji for the image-analysis macros.
-- R (with RStudio recommended) for the `.Rmd` notebooks; they use the `here`
-  package for portable paths.
+- R (>= 4.0) and the `here` package.
+- All other packages are installed and attached automatically on first run by
+  `shared/dependencies.R` (sourced at the top of each notebook).
 
-## R dependencies
+## Running
 
-The R packages every notebook needs are declared in one place,
-`shared/dependencies.R`. Each notebook loads them near the top with
+Open either notebook and knit it, or run it chunk by chunk:
 
-    if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
-    source(here::here("shared", "dependencies.R"))
+```r
+# from the repository root
+rmarkdown::render("experiments/Experiment_1/scripts/Exp1.Rmd")
+rmarkdown::render("experiments/Experiment_2/scripts/Exp2.Rmd")
+```
 
-so there is nothing to install by hand: the first line bootstraps the `here`
-package (used to resolve repo-relative paths), and sourcing the script installs
-any of the remaining packages that are missing from CRAN, attaches them all,
-and sets the shared plotting theme. Paths are anchored by the `.here` file at
-the repo root, so this works from a clean clone with no edits.
+Paths are portable: `here::here()` resolves everything from the `.here` file at
+the repository root, so the notebooks run from a clean clone with no manual path
+edits. Output-writing lines (`ggsave()`, `write.table()`) are commented out by
+default — uncomment the ones you want to regenerate.
 
-To add a package for a new (or existing) experiment, add it to the list in
-`shared/dependencies.R` rather than calling `library()` inside a notebook; that
-keeps the dependency set in a single, reproducible place. The exact package
-*versions* are not pinned — for a fully version-locked environment, initialise
-[`renv`](https://rstudio.github.io/renv/) at the repo root.
+## Figure / table naming
 
-## Citing
-
-See `CITATION.cff`. Please cite the associated article once published.
-
-## License
-
-Code is released under the MIT License (`LICENSE`). Raw data is released under
-CC BY 4.0 - please attribute the authors when reusing.
+Final manuscript items are numbered (e.g. `1. Exp1_FBM.svg`, `S1. Exp2_ss.svg`);
+all other outputs are prefixed `Exp1_` / `Exp2_`.
